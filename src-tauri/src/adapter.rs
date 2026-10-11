@@ -1,5 +1,13 @@
-use std::{sync::{atomic::{AtomicBool, Ordering}, Arc}, thread, time::Duration};
-use crate::model::{EventLevel, ScanError, ScanState, SimulationMode, StartScanRequest};
+use crate::{
+    archive::CaptureProduct,
+    log_parser::{ParsedLog, SidecarLogParser},
+    model::{EventLevel, ScanError, ScanState, StartScanRequest},
+    process::{ProcessEvent, ProcessOutcome, ProcessRequest, ProcessRunner, RecordedProcessRunner},
+};
+use std::{
+    sync::{atomic::AtomicBool, Arc},
+    time::Duration,
+};
 
 pub struct AdapterStep {
     pub state: ScanState,
@@ -15,64 +23,183 @@ pub trait ScannerAdapter: Send + Sync + 'static {
         request: &StartScanRequest,
         cancelled: Arc<AtomicBool>,
         emit: &mut dyn FnMut(AdapterStep),
-    ) -> Result<(), ScanError>;
+    ) -> Result<CaptureProduct, ScanError>;
 }
 
-#[derive(Default)]
-pub struct FakeScannerAdapter;
+pub struct FakeScannerAdapter {
+    runner: Arc<dyn ProcessRunner>,
+}
 
-impl FakeScannerAdapter {
-    fn pause(cancelled: &AtomicBool) -> Result<(), ScanError> {
-        for _ in 0..4 {
-            if cancelled.load(Ordering::SeqCst) { return Err(ScanError::Cancelled); }
-            thread::sleep(Duration::from_millis(35));
+impl Default for FakeScannerAdapter {
+    fn default() -> Self {
+        Self {
+            runner: Arc::new(RecordedProcessRunner),
         }
-        Ok(())
     }
 }
 
 impl ScannerAdapter for FakeScannerAdapter {
-    fn name(&self) -> &'static str { "fake" }
+    fn name(&self) -> &'static str {
+        "fake"
+    }
 
-    fn scan(&self, request: &StartScanRequest, cancelled: Arc<AtomicBool>, emit: &mut dyn FnMut(AdapterStep)) -> Result<(), ScanError> {
-        let mut step = |state, progress, message: String| {
-            emit(AdapterStep { state, progress, message, level: EventLevel::Info });
+    fn scan(
+        &self,
+        request: &StartScanRequest,
+        cancelled: Arc<AtomicBool>,
+        emit: &mut dyn FnMut(AdapterStep),
+    ) -> Result<CaptureProduct, ScanError> {
+        let parser = SidecarLogParser;
+        let mut saw_eof = false;
+        let mut captured_bytes = None;
+        let mut saw_tiff = false;
+        let process_request = ProcessRequest {
+            frame: request.frame,
+            simulation: request.simulation,
+            timeout: Duration::from_secs(2),
         };
-        step(ScanState::Initializing, 5, "SANE-Initialisierung simuliert".into());
-        Self::pause(&cancelled)?;
-        step(ScanState::OpeningScanner, 14, "Minolta FS-V1 wird simuliert geöffnet".into());
-        Self::pause(&cancelled)?;
-        step(ScanState::WaitingForHolder, 20, "Frame-Range 1..1; Filmhalter wird erwartet".into());
-        Self::pause(&cancelled)?;
-        if request.simulation == SimulationMode::Timeout { return Err(ScanError::TimedOut); }
-        step(ScanState::ConfiguringFrame, 28, format!("35-mm-Halter erkannt; Frame {} · Color · 600 dpi", request.frame));
-        Self::pause(&cancelled)?;
-        step(ScanState::StartingScan, 34, "sane_start simuliert (ein Aufruf)".into());
-        Self::pause(&cancelled)?;
-        for (progress, bytes) in [(44, 196_608), (58, 458_752), (72, 851_968), (86, 1_245_184)] {
-            step(ScanState::Transferring, progress, format!("sane_read simuliert · {bytes} / 1438200 Byte"));
-            Self::pause(&cancelled)?;
-            if request.simulation == SimulationMode::Error && progress == 58 { return Err(ScanError::SimulatedIo); }
+        let outcome = self
+            .runner
+            .run(&process_request, cancelled, &mut |event| match event {
+                ProcessEvent::Started { program } => emit(AdapterStep {
+                    state: ScanState::Initializing,
+                    progress: 2,
+                    message: format!("Mock-Prozess gestartet: {program}"),
+                    level: EventLevel::Info,
+                }),
+                ProcessEvent::Stdout(line) => match parser.parse(&line) {
+                    ParsedLog::Initialized => step(
+                        emit,
+                        ScanState::Initializing,
+                        7,
+                        "Initialisierung bestätigt",
+                    ),
+                    ParsedLog::ScannerOpened => step(
+                        emit,
+                        ScanState::OpeningScanner,
+                        14,
+                        "Scanneröffnung bestätigt",
+                    ),
+                    ParsedLog::HolderDetected => {
+                        step(emit, ScanState::WaitingForHolder, 20, "Filmhalter erkannt");
+                        step(
+                            emit,
+                            ScanState::ConfiguringFrame,
+                            28,
+                            "Frame, RGB8 und 600 dpi konfiguriert",
+                        );
+                    }
+                    ParsedLog::FrameConfigured => {}
+                    ParsedLog::ScanOptionConfigured => step(
+                        emit,
+                        ScanState::ConfiguringFrame,
+                        30,
+                        "Scanoption bestätigt",
+                    ),
+                    ParsedLog::ScanStarted => {
+                        step(emit, ScanState::StartingScan, 34, "Scanstart bestätigt")
+                    }
+                    ParsedLog::Data { bytes } => {
+                        let progress = 40 + ((bytes.min(1_438_200) * 48 / 1_438_200) as u8);
+                        emit(AdapterStep {
+                            state: ScanState::Transferring,
+                            progress,
+                            message: format!("Datenstrom: {bytes} / 1438200 Byte"),
+                            level: EventLevel::Info,
+                        });
+                    }
+                    ParsedLog::Eof => {
+                        saw_eof = true;
+                        step(emit, ScanState::Transferring, 90, "EOF bestätigt");
+                    }
+                    ParsedLog::CaptureComplete { bytes } => captured_bytes = Some(bytes),
+                    ParsedLog::TiffWritten => {
+                        saw_tiff = true;
+                        step(
+                            emit,
+                            ScanState::Finalizing,
+                            97,
+                            "TIFF-Finalisierung bestätigt",
+                        );
+                    }
+                    ParsedLog::Unknown(message) => emit(AdapterStep {
+                        state: current_state_for_unknown(saw_eof),
+                        progress: if saw_eof { 92 } else { 16 },
+                        message: format!("Unbekannte Logmeldung ignoriert: {message}"),
+                        level: EventLevel::Warning,
+                    }),
+                },
+                ProcessEvent::Stderr(message) => emit(AdapterStep {
+                    state: ScanState::Transferring,
+                    progress: 45,
+                    message: format!("Mock-Prozess stderr: {message}"),
+                    level: EventLevel::Error,
+                }),
+                ProcessEvent::Exited { .. }
+                | ProcessEvent::Cancelled
+                | ProcessEvent::TimedOut
+                | ProcessEvent::CleanedUp => {}
+            });
+
+        match outcome {
+            ProcessOutcome::Cancelled => return Err(ScanError::Cancelled),
+            ProcessOutcome::TimedOut => return Err(ScanError::TimedOut),
+            ProcessOutcome::Exited(code) if code != 0 => return Err(ScanError::ProcessExit(code)),
+            ProcessOutcome::Exited(_) => {}
         }
-        step(ScanState::Transferring, 92, "SANE_STATUS_EOF · 1438200 Byte vollständig".into());
-        Self::pause(&cancelled)?;
-        step(ScanState::Finalizing, 97, "RAW, Parameter und TIFF werden simuliert finalisiert".into());
-        Self::pause(&cancelled)?;
-        Ok(())
+        if !saw_eof || captured_bytes != Some(1_438_200) || !saw_tiff {
+            return Err(ScanError::IncompleteStream);
+        }
+        Ok(CaptureProduct {
+            raw: b"BEBLOG-MOCK-RAW\nsource=research-009-recorded-log\n".to_vec(),
+            tiff: b"BEBLOG-MOCK-TIFF\nnot-a-production-image\n".to_vec(),
+            expected_raw_bytes: 1_438_200,
+        })
+    }
+}
+
+fn step(emit: &mut dyn FnMut(AdapterStep), state: ScanState, progress: u8, message: &str) {
+    emit(AdapterStep {
+        state,
+        progress,
+        message: message.into(),
+        level: EventLevel::Info,
+    });
+}
+
+fn current_state_for_unknown(eof: bool) -> ScanState {
+    if eof {
+        ScanState::Transferring
+    } else {
+        ScanState::OpeningScanner
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::SimulationMode;
 
-    fn request(simulation: SimulationMode) -> StartScanRequest { StartScanRequest { frame: 1, simulation } }
+    fn request(simulation: SimulationMode) -> StartScanRequest {
+        StartScanRequest {
+            frame: 1,
+            simulation,
+        }
+    }
 
     #[test]
     fn fake_adapter_reaches_eof_without_hardware() {
         let mut steps = Vec::new();
-        FakeScannerAdapter.scan(&request(SimulationMode::Success), Arc::new(AtomicBool::new(false)), &mut |step| steps.push(step)).unwrap();
-        assert!(steps.iter().any(|step| step.message.contains("SANE_STATUS_EOF")));
+        FakeScannerAdapter::default()
+            .scan(
+                &request(SimulationMode::Success),
+                Arc::new(AtomicBool::new(false)),
+                &mut |step| steps.push(step),
+            )
+            .unwrap();
+        assert!(steps
+            .iter()
+            .any(|step| step.message.contains("EOF bestätigt")));
         assert_eq!(steps.last().unwrap().state, ScanState::Finalizing);
         let fixture = include_str!("../tests/fixtures/research-009-success.fixture");
         assert!(fixture.contains("capture ended: total=1438200"));
@@ -81,19 +208,62 @@ mod tests {
 
     #[test]
     fn fake_adapter_reports_timeout() {
-        let result = FakeScannerAdapter.scan(&request(SimulationMode::Timeout), Arc::new(AtomicBool::new(false)), &mut |_| {});
+        let result = FakeScannerAdapter::default().scan(
+            &request(SimulationMode::Timeout),
+            Arc::new(AtomicBool::new(false)),
+            &mut |_| {},
+        );
         assert_eq!(result, Err(ScanError::TimedOut));
     }
 
     #[test]
     fn fake_adapter_honours_cancellation() {
         let cancelled = Arc::new(AtomicBool::new(true));
-        let result = FakeScannerAdapter.scan(&request(SimulationMode::Success), cancelled, &mut |_| {});
+        let result = FakeScannerAdapter::default().scan(
+            &request(SimulationMode::Success),
+            cancelled,
+            &mut |_| {},
+        );
         assert_eq!(result, Err(ScanError::Cancelled));
     }
 
     #[test]
     fn real_adapter_is_not_available_in_this_build() {
-        assert_eq!(FakeScannerAdapter.name(), "fake");
+        assert_eq!(FakeScannerAdapter::default().name(), "fake");
+    }
+
+    #[test]
+    fn nonzero_exit_is_an_error() {
+        let result = FakeScannerAdapter::default().scan(
+            &request(SimulationMode::Error),
+            Arc::new(AtomicBool::new(false)),
+            &mut |_| {},
+        );
+        assert_eq!(result, Err(ScanError::ProcessExit(1)));
+    }
+
+    #[test]
+    fn incomplete_stream_is_rejected_even_with_exit_zero() {
+        let result = FakeScannerAdapter::default().scan(
+            &request(SimulationMode::Incomplete),
+            Arc::new(AtomicBool::new(false)),
+            &mut |_| {},
+        );
+        assert_eq!(result, Err(ScanError::IncompleteStream));
+    }
+
+    #[test]
+    fn unknown_log_message_is_diagnostic_not_failure() {
+        let mut steps = Vec::new();
+        FakeScannerAdapter::default()
+            .scan(
+                &request(SimulationMode::Success),
+                Arc::new(AtomicBool::new(false)),
+                &mut |step| steps.push(step),
+            )
+            .unwrap();
+        assert!(steps
+            .iter()
+            .any(|step| step.message.contains("Unbekannte Logmeldung ignoriert")));
     }
 }

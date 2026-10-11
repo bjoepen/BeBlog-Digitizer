@@ -1,5 +1,8 @@
-# Extracted from the read-only Research-009 Hardware PASS client log.
+# Extracted from the FINAL read-only Research-009 Hardware PASS logs (17:26 run).
 # This is a textual test fixture only; it is never executed.
+# Backend SHA256: 732820b2bf2c1d525cc1ce91dbfc8852a77130de0e8df0e823b8dab309cc59f6
+send_gamma: table_raw_size: 4096, table_size: 4096
+send_gamma: sending 4096 bytes gamma table.
 sane_init -> 0 (Success)
 sane_open (only call) -> 0 (Success)
 holder poll 18: frame descriptor range=1..6 quant=1
@@ -9,4 +12,5 @@ sane_control_option(resolution, SET=600) -> 0 (Success)
 sane_start (only call) -> 0 (Success)
 sane_read -> 5 (End of file reached), bytes=0
 capture ended: total=1438200 terminal=5 (End of file reached)
+TIFF capture.tiff -> written
 client exit -> 0 (Success)

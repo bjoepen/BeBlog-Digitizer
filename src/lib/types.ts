@@ -3,7 +3,7 @@ export type ScanState =
   | "configuringFrame" | "startingScan" | "transferring" | "finalizing"
   | "completed" | "cancelling" | "cancelled" | "failed" | "timedOut";
 
-export type SimulationMode = "success" | "error" | "timeout";
+export type SimulationMode = "success" | "error" | "timeout" | "incomplete";
 
 export interface ScanEvent {
   jobId: string;
