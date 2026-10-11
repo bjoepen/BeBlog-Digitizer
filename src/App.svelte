@@ -98,6 +98,7 @@
           <option value="success">Research-009-Erfolg</option>
           <option value="error">Simulierter Lesefehler</option>
           <option value="timeout">Simulierter Halter-Timeout</option>
+          <option value="incomplete">Unvollständiger Datenstrom</option>
         </select>
       </label>
 
@@ -131,7 +132,7 @@
   </div>
 
   <section class="future-grid">
-    <article class="placeholder"><p class="step">SCANARCHIV</p><h3>Aufnahmen bewahren</h3><p>Unveränderliche RAW-Dateien, Metadaten und Prüfsummen folgen in einem späteren Build.</p><span>Vorbereitet</span></article>
+    <article class="placeholder"><p class="step">SCANARCHIV</p><h3>Aufnahmen bewahren</h3><p>Kollisionsfreie Capture-Verzeichnisse, Manifeste und SHA-256-Prüfsummen sind im Application Core aktiv.</p><span>Grundlage aktiv</span></article>
     <article class="placeholder"><p class="step">BILDENTWICKLUNG</p><h3>Getrennt entwickeln</h3><p>Farbentwicklung und Derivate bleiben strikt vom Scannerprozess getrennt.</p><span>Vorbereitet</span></article>
   </section>
 </main>

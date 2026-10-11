@@ -19,5 +19,6 @@ describe("App", () => {
     expect(screen.getByRole("button", { name: "Simulierten Scan starten" })).toBeEnabled();
     expect(screen.getByText("RGB8")).toBeInTheDocument();
     expect(screen.getByText("600 dpi")).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "Unvollständiger Datenstrom" })).toBeInTheDocument();
   });
 });

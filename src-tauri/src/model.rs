@@ -21,13 +21,21 @@ pub enum ScanState {
 #[cfg(test)]
 impl ScanState {
     pub fn terminal(self) -> bool {
-        matches!(self, Self::Completed | Self::Cancelled | Self::Failed | Self::TimedOut)
+        matches!(
+            self,
+            Self::Completed | Self::Cancelled | Self::Failed | Self::TimedOut
+        )
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub enum SimulationMode { Success, Error, Timeout }
+pub enum SimulationMode {
+    Success,
+    Error,
+    Timeout,
+    Incomplete,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -49,7 +57,11 @@ pub struct ScanEvent {
 
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub enum EventLevel { Info, Warning, Error }
+pub enum EventLevel {
+    Info,
+    Warning,
+    Error,
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -63,4 +75,9 @@ pub struct AppSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ScanError { Cancelled, TimedOut, SimulatedIo }
+pub enum ScanError {
+    Cancelled,
+    TimedOut,
+    ProcessExit(i32),
+    IncompleteStream,
+}

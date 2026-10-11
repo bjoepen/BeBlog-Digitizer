@@ -1,0 +1,660 @@
+use crate::model::StartScanRequest;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::{
+    fs::{self, OpenOptions},
+    io::{self, Write},
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+static CAPTURE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+fn legacy_capture_kind() -> CaptureKind {
+    CaptureKind::UnclassifiedLegacy
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ArchiveStatus {
+    InProgress,
+    Completed,
+    Failed,
+    Cancelled,
+    TimedOut,
+    Interrupted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CaptureKind {
+    Simulation,
+    Production,
+    UnclassifiedLegacy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileMetadata {
+    pub name: String,
+    pub media_type: String,
+    pub bytes: u64,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureManifest {
+    pub schema_version: u8,
+    pub capture_id: String,
+    pub status: ArchiveStatus,
+    #[serde(default = "legacy_capture_kind")]
+    pub capture_kind: CaptureKind,
+    pub frame: u8,
+    pub pixel_format: String,
+    pub resolution_dpi: u16,
+    pub expected_raw_bytes: u64,
+    pub files: Vec<FileMetadata>,
+    pub failure: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct PendingCapture {
+    pub id: String,
+    pub directory: PathBuf,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct CaptureProduct {
+    pub raw: Vec<u8>,
+    pub tiff: Vec<u8>,
+    pub expected_raw_bytes: u64,
+    pub kind: CaptureKind,
+}
+
+#[derive(Clone)]
+pub struct ArchiveManager {
+    root: PathBuf,
+}
+
+impl ArchiveManager {
+    pub fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+
+    #[cfg(test)]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn next_capture_id() -> String {
+        let millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let sequence = CAPTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        format!("capture-{millis}-{sequence:06}")
+    }
+
+    pub fn begin(
+        &self,
+        request: &StartScanRequest,
+        kind: CaptureKind,
+    ) -> io::Result<PendingCapture> {
+        self.begin_with_id(&Self::next_capture_id(), request, kind)
+    }
+
+    fn begin_with_id(
+        &self,
+        id: &str,
+        request: &StartScanRequest,
+        kind: CaptureKind,
+    ) -> io::Result<PendingCapture> {
+        fs::create_dir_all(&self.root)?;
+        let directory = self.root.join(id);
+        fs::create_dir(&directory)?; // fails on collision; never reuses a capture
+        let manifest = CaptureManifest {
+            schema_version: 2,
+            capture_id: id.to_string(),
+            status: ArchiveStatus::InProgress,
+            capture_kind: kind,
+            frame: request.frame,
+            pixel_format: "RGB8".into(),
+            resolution_dpi: 600,
+            expected_raw_bytes: 1_438_200,
+            files: Vec::new(),
+            failure: None,
+        };
+        write_manifest(&directory, &manifest)?;
+        Ok(PendingCapture {
+            id: id.to_string(),
+            directory,
+        })
+    }
+
+    pub fn finalize(
+        &self,
+        pending: &PendingCapture,
+        product: CaptureProduct,
+    ) -> io::Result<CaptureManifest> {
+        let result = self.finalize_inner(pending, product);
+        if let Err(error) = &result {
+            let _ = self.mark(
+                pending,
+                ArchiveStatus::Failed,
+                format!("Finalisierung/Validierung: {error}"),
+            );
+        }
+        result
+    }
+
+    fn finalize_inner(
+        &self,
+        pending: &PendingCapture,
+        product: CaptureProduct,
+    ) -> io::Result<CaptureManifest> {
+        let mut manifest = read_manifest(&pending.directory)?;
+        if manifest.status != ArchiveStatus::InProgress {
+            return Err(invalid_data("Capture ist nicht mehr in Bearbeitung"));
+        }
+        if manifest.capture_kind != product.kind {
+            return Err(invalid_data(
+                "Capture-Herkunft stimmt nicht mit Produkt überein",
+            ));
+        }
+        if product.expected_raw_bytes != manifest.expected_raw_bytes {
+            return Err(invalid_data(format!(
+                "Angekündigte RAW-Größe {} entspricht nicht dem Captureprofil {}",
+                product.expected_raw_bytes, manifest.expected_raw_bytes
+            )));
+        }
+        if product.expected_raw_bytes == 0
+            || (product.kind == CaptureKind::Production
+                && product.raw.len() as u64 != product.expected_raw_bytes)
+        {
+            return Err(invalid_data(format!(
+                "RAW-Dateigröße {} entspricht nicht der erwarteten Größe {}",
+                product.raw.len(),
+                product.expected_raw_bytes
+            )));
+        }
+        validate_raw(&product.raw, product.kind)?;
+        validate_tiff(&product.tiff, product.kind)?;
+
+        let raw = write_original(
+            &pending.directory,
+            "capture.raw",
+            "application/x-beblog-raw",
+            &product.raw,
+        )?;
+        manifest.files.push(raw);
+        write_manifest(&pending.directory, &manifest)?;
+        let tiff = write_original(
+            &pending.directory,
+            "capture.tiff",
+            "image/tiff",
+            &product.tiff,
+        )?;
+        manifest.files.push(tiff);
+        validate_manifest_files(&pending.directory, &manifest)?;
+        manifest.status = ArchiveStatus::Completed;
+        write_manifest(&pending.directory, &manifest)?;
+        Ok(manifest)
+    }
+
+    pub fn mark(
+        &self,
+        pending: &PendingCapture,
+        status: ArchiveStatus,
+        reason: impl Into<String>,
+    ) -> io::Result<()> {
+        if matches!(status, ArchiveStatus::InProgress | ArchiveStatus::Completed) {
+            return Err(invalid_data(
+                "Dieser Archivstatus darf nicht über die Fehler-Markierung gesetzt werden",
+            ));
+        }
+        let mut manifest = read_manifest(&pending.directory)?;
+        if manifest.status != ArchiveStatus::InProgress {
+            return Err(invalid_data(
+                "Terminaler Archivstatus darf nicht überschrieben werden",
+            ));
+        }
+        manifest.status = status;
+        manifest.failure = Some(reason.into());
+        write_manifest(&pending.directory, &manifest)
+    }
+
+    pub fn recover_incomplete(&self) -> io::Result<Vec<String>> {
+        if !self.root.exists() {
+            return Ok(Vec::new());
+        }
+        let mut recovered = Vec::new();
+        for entry in fs::read_dir(&self.root)? {
+            let directory = entry?.path();
+            if !directory.is_dir() || !directory.join("manifest.json").is_file() {
+                continue;
+            }
+            let mut manifest = read_manifest(&directory)?;
+            if manifest.status == ArchiveStatus::InProgress {
+                manifest.status = ArchiveStatus::Interrupted;
+                manifest.failure = Some("Application ended before capture finalization".into());
+                write_manifest(&directory, &manifest)?;
+                recovered.push(manifest.capture_id);
+            }
+        }
+        Ok(recovered)
+    }
+}
+
+fn write_original(
+    directory: &Path,
+    name: &str,
+    media_type: &str,
+    bytes: &[u8],
+) -> io::Result<FileMetadata> {
+    let path = directory.join(name);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    let sha256 = format!("{:x}", Sha256::digest(bytes));
+    Ok(FileMetadata {
+        name: name.into(),
+        media_type: media_type.into(),
+        bytes: bytes.len() as u64,
+        sha256,
+    })
+}
+
+fn read_manifest(directory: &Path) -> io::Result<CaptureManifest> {
+    let bytes = fs::read(directory.join("manifest.json"))?;
+    serde_json::from_slice(&bytes).map_err(io::Error::other)
+}
+
+fn write_manifest(directory: &Path, manifest: &CaptureManifest) -> io::Result<()> {
+    let bytes = serde_json::to_vec_pretty(manifest).map_err(io::Error::other)?;
+    let temporary = directory.join("manifest.json.tmp");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&temporary)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    fs::rename(temporary, directory.join("manifest.json"))
+}
+
+fn invalid_data(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+fn validate_manifest_files(directory: &Path, manifest: &CaptureManifest) -> io::Result<()> {
+    for metadata in &manifest.files {
+        let bytes = fs::read(directory.join(&metadata.name))?;
+        if bytes.len() as u64 != metadata.bytes
+            || format!("{:x}", Sha256::digest(&bytes)) != metadata.sha256
+        {
+            return Err(invalid_data(format!(
+                "Dateikonsistenz fehlgeschlagen: {}",
+                metadata.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_tiff(bytes: &[u8], kind: CaptureKind) -> io::Result<()> {
+    if kind == CaptureKind::Simulation {
+        return if bytes.starts_with(b"BEBLOG-MOCK-TIFF\n") {
+            Ok(())
+        } else {
+            Err(invalid_data("Ungültige TIFF-Simulationsfixture"))
+        };
+    }
+    if bytes.len() < 8 {
+        return Err(invalid_data("TIFF-Header unvollständig"));
+    }
+    let little = match &bytes[..2] {
+        b"II" => true,
+        b"MM" => false,
+        _ => return Err(invalid_data("Ungültige TIFF-Byteordnung")),
+    };
+    let u16_at = |offset: usize| -> u16 {
+        let pair = [bytes[offset], bytes[offset + 1]];
+        if little {
+            u16::from_le_bytes(pair)
+        } else {
+            u16::from_be_bytes(pair)
+        }
+    };
+    let u32_at = |offset: usize| -> u32 {
+        let value = [
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ];
+        if little {
+            u32::from_le_bytes(value)
+        } else {
+            u32::from_be_bytes(value)
+        }
+    };
+    if u16_at(2) != 42 {
+        return Err(invalid_data("Ungültige TIFF-Magic"));
+    }
+    let ifd = u32_at(4) as usize;
+    if ifd
+        .checked_add(2)
+        .filter(|end| *end <= bytes.len())
+        .is_none()
+    {
+        return Err(invalid_data("TIFF-IFD-Offset außerhalb der Datei"));
+    }
+    let entries = u16_at(ifd) as usize;
+    let end = ifd
+        .checked_add(2)
+        .and_then(|start| start.checked_add(entries.checked_mul(12)?))
+        .and_then(|end| end.checked_add(4));
+    if end.filter(|end| *end <= bytes.len()).is_none() {
+        return Err(invalid_data("TIFF-IFD ist abgeschnitten"));
+    }
+    let mut strips: Option<(Vec<u32>, Vec<u32>)> = None;
+    let mut tiles: Option<(Vec<u32>, Vec<u32>)> = None;
+    let mut has_width = false;
+    let mut has_height = false;
+    for index in 0..entries {
+        let entry = ifd + 2 + index * 12;
+        let tag = u16_at(entry);
+        if matches!(tag, 256 | 257) {
+            let field_type = u16_at(entry + 2);
+            let count = u32_at(entry + 4);
+            let value = match field_type {
+                3 if count == 1 => u16_at(entry + 8) as u32,
+                4 if count == 1 => u32_at(entry + 8),
+                _ => return Err(invalid_data("Ungültige TIFF-Bildabmessung")),
+            };
+            if value == 0 {
+                return Err(invalid_data("TIFF-Bildabmessung ist null"));
+            }
+            if tag == 256 {
+                has_width = true;
+            } else {
+                has_height = true;
+            }
+            continue;
+        }
+        if !matches!(tag, 273 | 279 | 324 | 325) {
+            continue;
+        }
+        let field_type = u16_at(entry + 2);
+        let count = u32_at(entry + 4) as usize;
+        if count == 0 || !matches!(field_type, 3 | 4) {
+            return Err(invalid_data("Ungültiger TIFF-Strip-/Tile-Eintrag"));
+        }
+        let type_size = if field_type == 3 { 2 } else { 4 };
+        let byte_size = count
+            .checked_mul(type_size)
+            .ok_or_else(|| invalid_data("TIFF-Eintragsgröße überläuft"))?;
+        let data_start = if byte_size <= 4 {
+            entry + 8
+        } else {
+            u32_at(entry + 8) as usize
+        };
+        let data_end = data_start
+            .checked_add(byte_size)
+            .filter(|end| *end <= bytes.len())
+            .ok_or_else(|| invalid_data("TIFF-Strip-/Tile-Array außerhalb der Datei"))?;
+        let mut values = Vec::with_capacity(count);
+        for item in 0..count {
+            let position = data_start + item * type_size;
+            values.push(if field_type == 3 {
+                u16_at(position) as u32
+            } else {
+                u32_at(position)
+            });
+        }
+        let _ = data_end;
+        match tag {
+            273 => strips.get_or_insert_with(|| (Vec::new(), Vec::new())).0 = values,
+            279 => strips.get_or_insert_with(|| (Vec::new(), Vec::new())).1 = values,
+            324 => tiles.get_or_insert_with(|| (Vec::new(), Vec::new())).0 = values,
+            325 => tiles.get_or_insert_with(|| (Vec::new(), Vec::new())).1 = values,
+            _ => unreachable!(),
+        };
+    }
+    let has_image_data = [strips, tiles]
+        .into_iter()
+        .flatten()
+        .any(|(offsets, sizes)| {
+            !offsets.is_empty()
+                && offsets.len() == sizes.len()
+                && offsets.iter().zip(sizes).all(|(offset, size)| {
+                    size > 0
+                        && (*offset as usize)
+                            .checked_add(size as usize)
+                            .is_some_and(|end| end <= bytes.len())
+                })
+        });
+    if !has_width || !has_height || !has_image_data {
+        return Err(invalid_data(
+            "TIFF-Abmessungen oder konsistente Bilddaten-Strips/Tiles fehlen",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_raw(bytes: &[u8], kind: CaptureKind) -> io::Result<()> {
+    match kind {
+        CaptureKind::Simulation if !bytes.starts_with(b"BEBLOG-MOCK-RAW\n") => {
+            Err(invalid_data("Ungültige RAW-Simulationsfixture"))
+        }
+        CaptureKind::Production if bytes.starts_with(b"BEBLOG-MOCK-RAW\n") => Err(invalid_data(
+            "Mock-RAW darf nicht als Produktionsscan archiviert werden",
+        )),
+        CaptureKind::Simulation | CaptureKind::Production => Ok(()),
+        CaptureKind::UnclassifiedLegacy => Err(invalid_data(
+            "Unklassifizierte Altarchive dürfen nicht finalisiert werden",
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::SimulationMode;
+
+    fn temp_root(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "beblog-{label}-{}",
+            ArchiveManager::next_capture_id()
+        ))
+    }
+    fn request() -> StartScanRequest {
+        StartScanRequest {
+            frame: 1,
+            simulation: SimulationMode::Success,
+        }
+    }
+
+    fn simulated_product() -> CaptureProduct {
+        let raw = b"BEBLOG-MOCK-RAW\nfixture only\n".to_vec();
+        CaptureProduct {
+            expected_raw_bytes: 1_438_200,
+            raw,
+            tiff: b"BEBLOG-MOCK-TIFF\nfixture only\n".to_vec(),
+            kind: CaptureKind::Simulation,
+        }
+    }
+
+    fn production_product(raw: Vec<u8>, tiff: Vec<u8>, expected_raw_bytes: u64) -> CaptureProduct {
+        CaptureProduct {
+            raw,
+            tiff,
+            expected_raw_bytes,
+            kind: CaptureKind::Production,
+        }
+    }
+
+    fn valid_tiff() -> Vec<u8> {
+        vec![
+            b'I', b'I', 42, 0, 8, 0, 0, 0, 4, 0, 0, 1, 4, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 1, 4, 0, 1,
+            0, 0, 0, 1, 0, 0, 0, 0x11, 1, 4, 0, 1, 0, 0, 0, 62, 0, 0, 0, 0x17, 1, 4, 0, 1, 0, 0, 0,
+            3, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3,
+        ]
+    }
+
+    #[test]
+    fn refuses_capture_directory_collision() {
+        let root = temp_root("collision");
+        let archive = ArchiveManager::new(root.clone());
+        archive
+            .begin_with_id("fixed", &request(), CaptureKind::Simulation)
+            .unwrap();
+        assert_eq!(
+            archive
+                .begin_with_id("fixed", &request(), CaptureKind::Simulation)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn finalizes_originals_with_checksums_and_no_overwrite() {
+        let root = temp_root("finalize");
+        let archive = ArchiveManager::new(root.clone());
+        let pending = archive.begin(&request(), CaptureKind::Simulation).unwrap();
+        let manifest = archive.finalize(&pending, simulated_product()).unwrap();
+        assert_eq!(manifest.status, ArchiveStatus::Completed);
+        assert_eq!(manifest.capture_kind, CaptureKind::Simulation);
+        assert_eq!(manifest.files.len(), 2);
+        assert!(manifest.files.iter().all(|file| file.sha256.len() == 64));
+        assert_eq!(
+            manifest.files[0].bytes,
+            simulated_product().raw.len() as u64
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_wrong_production_raw_size_and_marks_failed() {
+        let root = temp_root("raw-invalid");
+        let archive = ArchiveManager::new(root.clone());
+        let pending = archive.begin(&request(), CaptureKind::Production).unwrap();
+        let error = archive
+            .finalize(
+                &pending,
+                production_product(vec![1, 2], valid_tiff(), 1_438_200),
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let manifest = read_manifest(&pending.directory).unwrap();
+        assert_eq!(manifest.status, ArchiveStatus::Failed);
+        assert!(manifest.files.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_invalid_production_tiff_structure() {
+        let root = temp_root("tiff-invalid");
+        let archive = ArchiveManager::new(root.clone());
+        let pending = archive.begin(&request(), CaptureKind::Production).unwrap();
+        let error = archive
+            .finalize(
+                &pending,
+                production_product(vec![1, 2], b"II*\0\xff\xff\xff\x7f".to_vec(), 2),
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            read_manifest(&pending.directory).unwrap().status,
+            ArchiveStatus::Failed
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn accepts_structurally_valid_production_tiff_and_exact_raw_size() {
+        let root = temp_root("production-valid");
+        let archive = ArchiveManager::new(root.clone());
+        let pending = archive.begin(&request(), CaptureKind::Production).unwrap();
+        let manifest = archive
+            .finalize(
+                &pending,
+                production_product(vec![7; 1_438_200], valid_tiff(), 1_438_200),
+            )
+            .unwrap();
+        assert_eq!(manifest.status, ArchiveStatus::Completed);
+        assert_eq!(manifest.files[0].bytes, 1_438_200);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn verifies_written_file_size_and_checksum_from_disk() {
+        let root = temp_root("checksum");
+        let archive = ArchiveManager::new(root.clone());
+        let pending = archive.begin(&request(), CaptureKind::Simulation).unwrap();
+        let manifest = archive.finalize(&pending, simulated_product()).unwrap();
+        validate_manifest_files(&pending.directory, &manifest).unwrap();
+        fs::write(pending.directory.join("capture.raw"), b"tampered").unwrap();
+        assert_eq!(
+            validate_manifest_files(&pending.directory, &manifest)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn partial_write_error_leaves_failed_archive_and_preserves_original() {
+        let root = temp_root("partial");
+        let archive = ArchiveManager::new(root.clone());
+        let pending = archive.begin(&request(), CaptureKind::Simulation).unwrap();
+        fs::write(
+            pending.directory.join("capture.tiff"),
+            b"pre-existing-original",
+        )
+        .unwrap();
+        let error = archive.finalize(&pending, simulated_product()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            fs::read(pending.directory.join("capture.tiff")).unwrap(),
+            b"pre-existing-original"
+        );
+        let manifest = read_manifest(&pending.directory).unwrap();
+        assert_eq!(manifest.status, ArchiveStatus::Failed);
+        assert_eq!(manifest.files.len(), 1);
+        assert_eq!(manifest.files[0].name, "capture.raw");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovers_interrupted_manifest() {
+        let root = temp_root("recovery");
+        let archive = ArchiveManager::new(root.clone());
+        let pending = archive.begin(&request(), CaptureKind::Simulation).unwrap();
+        assert_eq!(
+            archive.recover_incomplete().unwrap(),
+            vec![pending.id.clone()]
+        );
+        assert_eq!(
+            read_manifest(&pending.directory).unwrap().status,
+            ArchiveStatus::Interrupted
+        );
+        assert!(archive.recover_incomplete().unwrap().is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_manifest_is_not_misclassified_as_simulation_or_production() {
+        let old = r#"{"schemaVersion":1,"captureId":"legacy","status":"inProgress","frame":1,"pixelFormat":"RGB8","resolutionDpi":600,"expectedRawBytes":1438200,"files":[],"failure":null}"#;
+        let manifest: CaptureManifest = serde_json::from_str(old).unwrap();
+        assert_eq!(manifest.capture_kind, CaptureKind::UnclassifiedLegacy);
+    }
+}
