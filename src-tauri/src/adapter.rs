@@ -1,5 +1,5 @@
 use crate::{
-    archive::CaptureProduct,
+    archive::{CaptureKind, CaptureProduct},
     log_parser::{ParsedLog, SidecarLogParser},
     model::{EventLevel, ScanError, ScanState, StartScanRequest},
     process::{ProcessEvent, ProcessOutcome, ProcessRequest, ProcessRunner, RecordedProcessRunner},
@@ -18,6 +18,7 @@ pub struct AdapterStep {
 
 pub trait ScannerAdapter: Send + Sync + 'static {
     fn name(&self) -> &'static str;
+    fn capture_kind(&self) -> CaptureKind;
     fn scan(
         &self,
         request: &StartScanRequest,
@@ -41,6 +42,10 @@ impl Default for FakeScannerAdapter {
 impl ScannerAdapter for FakeScannerAdapter {
     fn name(&self) -> &'static str {
         "fake"
+    }
+
+    fn capture_kind(&self) -> CaptureKind {
+        CaptureKind::Simulation
     }
 
     fn scan(
@@ -150,10 +155,12 @@ impl ScannerAdapter for FakeScannerAdapter {
         if !saw_eof || captured_bytes != Some(1_438_200) || !saw_tiff {
             return Err(ScanError::IncompleteStream);
         }
+        let raw = b"BEBLOG-MOCK-RAW\nsource=research-009-recorded-log\n".to_vec();
         Ok(CaptureProduct {
-            raw: b"BEBLOG-MOCK-RAW\nsource=research-009-recorded-log\n".to_vec(),
-            tiff: b"BEBLOG-MOCK-TIFF\nnot-a-production-image\n".to_vec(),
             expected_raw_bytes: 1_438_200,
+            raw,
+            tiff: b"BEBLOG-MOCK-TIFF\nnot-a-production-image\n".to_vec(),
+            kind: CaptureKind::Simulation,
         })
     }
 }

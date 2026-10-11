@@ -114,7 +114,7 @@ impl AppCore {
             ensure_idle(&data)?;
             let pending = self
                 .archive
-                .begin(&request)
+                .begin(&request, self.adapter.capture_kind())
                 .map_err(|error| format!("Capture-Archiv konnte nicht angelegt werden: {error}"))?;
             data.active = Some(ActiveJob {
                 id: id.clone(),
@@ -174,8 +174,34 @@ impl AppCore {
     ) {
         let mut machine = ScanStateMachine::default();
         let result = self.adapter.scan(&request, cancelled.clone(), &mut |step| {
-            if machine.transition(step.state).is_ok() {
-                self.record_and_emit(&app, &id, step);
+            if cancelled.load(Ordering::SeqCst) {
+                emit(
+                    &app,
+                    ScanEvent::new(
+                        id.clone(),
+                        ScanState::Cancelling,
+                        self.current_progress(),
+                        "Adapter-Ereignis nach Abbruchanforderung ignoriert",
+                        EventLevel::Warning,
+                    ),
+                );
+                return;
+            }
+            match machine.transition(step.state) {
+                Ok(()) => self.record_and_emit(&app, &id, step),
+                Err(error) => {
+                    let current = self.snapshot().state;
+                    emit(
+                        &app,
+                        ScanEvent::new(
+                            id.clone(),
+                            current,
+                            self.current_progress(),
+                            format!("Ungültiger Adapter-Zustandsübergang verworfen: {error}"),
+                            EventLevel::Error,
+                        ),
+                    );
+                }
             }
         });
 
@@ -184,6 +210,13 @@ impl AppCore {
         } else {
             result
         };
+        let result = result.and_then(|product| {
+            if machine.state() == ScanState::Finalizing {
+                Ok(product)
+            } else {
+                Err(ScanError::IncompleteStream)
+            }
+        });
         let (terminal, progress, message, level) = match result {
             Ok(product) => match self.archive.finalize(&pending, product) {
                 Ok(_) => (
@@ -258,7 +291,27 @@ impl AppCore {
                 )
             }
         };
-        let _ = machine.transition(terminal);
+        if let Err(error) = machine.transition(terminal) {
+            let _ = self.archive.mark(
+                &pending,
+                ArchiveStatus::Failed,
+                format!("Zustandsabschluss fehlgeschlagen: {error}"),
+            );
+            let terminal = ScanState::Failed;
+            let progress = self.current_progress();
+            self.finish_job(&id, terminal, progress);
+            emit(
+                &app,
+                ScanEvent::new(
+                    id,
+                    terminal,
+                    progress,
+                    format!("Inkonsistenter Jobabschluss wurde als Fehler markiert: {error}"),
+                    EventLevel::Error,
+                ),
+            );
+            return;
+        }
         self.finish_job(&id, terminal, progress);
         emit(&app, ScanEvent::new(id, terminal, progress, message, level));
     }

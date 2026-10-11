@@ -14,7 +14,6 @@ impl Default for ScanStateMachine {
 }
 
 impl ScanStateMachine {
-    #[cfg(test)]
     pub fn state(&self) -> ScanState {
         self.state
     }
@@ -30,6 +29,9 @@ impl ScanStateMachine {
                 | (StartingScan, StartingScan)
                 | (Finalizing, Finalizing)
                 | (Idle, Initializing)
+                | (Idle, Cancelling)
+                | (Idle, Failed)
+                | (Idle, TimedOut)
                 | (Initializing, OpeningScanner)
                 | (OpeningScanner, WaitingForHolder)
                 | (WaitingForHolder, ConfiguringFrame)
@@ -52,13 +54,25 @@ impl ScanStateMachine {
                 | (
                     Initializing
                         | OpeningScanner
+                        | WaitingForHolder
                         | ConfiguringFrame
                         | StartingScan
                         | Transferring
-                        | Finalizing,
+                        | Finalizing
+                        | Cancelling,
                     Failed
                 )
-                | (OpeningScanner | WaitingForHolder, TimedOut)
+                | (
+                    Initializing
+                        | OpeningScanner
+                        | WaitingForHolder
+                        | ConfiguringFrame
+                        | StartingScan
+                        | Transferring
+                        | Finalizing
+                        | Cancelling,
+                    TimedOut
+                )
                 | (Completed | Cancelled | Failed | TimedOut, Idle)
         );
         if !allowed {
@@ -103,11 +117,40 @@ mod tests {
     }
 
     #[test]
+    fn invalid_transition_is_reported_without_mutating_state() {
+        let mut sm = ScanStateMachine::default();
+        let error = sm.transition(Completed).unwrap_err();
+        assert!(error.contains("Idle -> Completed"));
+        assert_eq!(sm.state(), Idle);
+    }
+
+    #[test]
     fn supports_controlled_cancellation() {
         let mut sm = ScanStateMachine::default();
         sm.transition(Initializing).unwrap();
         sm.transition(Cancelling).unwrap();
         sm.transition(Cancelled).unwrap();
         assert!(sm.state().terminal());
+    }
+
+    #[test]
+    fn timeout_and_process_failure_are_valid_from_active_states() {
+        let mut timed_out = ScanStateMachine::default();
+        for state in [
+            Initializing,
+            OpeningScanner,
+            WaitingForHolder,
+            ConfiguringFrame,
+        ] {
+            timed_out.transition(state).unwrap();
+        }
+        timed_out.transition(TimedOut).unwrap();
+
+        let mut failed = ScanStateMachine::default();
+        for state in [Initializing, OpeningScanner, WaitingForHolder] {
+            failed.transition(state).unwrap();
+        }
+        failed.transition(Failed).unwrap();
+        assert_eq!(failed.state(), Failed);
     }
 }
