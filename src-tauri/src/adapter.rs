@@ -1,6 +1,6 @@
 use crate::{
     archive::{CaptureKind, CaptureProduct},
-    log_parser::{ParsedLog, SidecarLogParser},
+    log_parser::{LogStream, ParsedLog, SidecarLogParser, TransferAccumulator},
     model::{EventLevel, HolderStatus, ScanError, ScanState, SimulationMode, StartScanRequest},
     process::{ProcessEvent, ProcessOutcome, ProcessRequest, ProcessRunner, RecordedProcessRunner},
 };
@@ -237,7 +237,8 @@ impl ScannerAdapter for FakeScannerAdapter {
         let mut saw_eof = false;
         let mut captured_bytes = None;
         let mut saw_tiff = false;
-        let mut last_data_bytes = 0_u64;
+        let mut transferred_bytes = TransferAccumulator::new(1_438_200);
+        let mut client_exit_code = None;
         let process_request = ProcessRequest {
             frame: request.frame,
             simulation: request.simulation,
@@ -271,11 +272,16 @@ impl ScannerAdapter for FakeScannerAdapter {
                     level: EventLevel::Error,
                     holder_status: None,
                 }),
-                ProcessEvent::Stdout(line) => {
+                log_event @ (ProcessEvent::Stdout(_) | ProcessEvent::Stderr(_)) => {
+                    let (stream, line) = match log_event {
+                        ProcessEvent::Stdout(line) => (LogStream::Stdout, line),
+                        ProcessEvent::Stderr(line) => (LogStream::Stderr, line),
+                        _ => unreachable!(),
+                    };
                     if stream_error.is_some() {
                         return;
                     }
-                    match parser.parse(&line) {
+                    match parser.parse(stream, &line) {
                     ParsedLog::Initialized => step(
                         emit,
                         ScanState::Initializing,
@@ -314,33 +320,47 @@ impl ScannerAdapter for FakeScannerAdapter {
                         step(emit, ScanState::StartingScan, 32, "Scanstart bestätigt");
                         step(emit, ScanState::Scanning, 34, "Scan läuft");
                     }
-                    ParsedLog::Data { bytes } => {
-                        if bytes <= last_data_bytes || bytes > 1_438_200 {
-                            let error = format!(
-                                "Nicht monotone oder ungültige Datenmenge: {last_data_bytes} -> {bytes}"
-                            );
-                            stream_error = Some(error.clone());
-                            emit(make_diagnostic(&error, EventLevel::Error));
-                            return;
-                        }
+                    ParsedLog::ReadChunk { bytes } => {
                         if saw_eof || captured_bytes.is_some() {
                             let error = "Datenmeldung nach EOF/Capture-Abschluss".to_string();
                             stream_error = Some(error.clone());
                             emit(make_diagnostic(&error, EventLevel::Error));
                             return;
                         }
-                        last_data_bytes = bytes;
-                        let progress = 40 + ((bytes.min(1_438_200) * 48 / 1_438_200) as u8);
+                        let total = match transferred_bytes.record_chunk(bytes) {
+                            Ok(total) => total,
+                            Err(error) => {
+                                let message = format!("Ungültige RAW-Chunkfolge: {error:?}");
+                                stream_error = Some(message.clone());
+                                emit(make_diagnostic(&message, EventLevel::Error));
+                                return;
+                            }
+                        };
+                        let progress = 40 + ((total.min(1_438_200) * 48 / 1_438_200) as u8);
                         emit(AdapterStep {
                             state: Some(ScanState::Transferring),
                             progress,
-                            message: format!("Datenstrom: {bytes} / 1438200 Byte"),
+                            message: format!("Datenchunk: {bytes} Byte; kumuliert {total} / 1438200 Byte"),
                             level: EventLevel::Info,
                             holder_status: None,
                         });
                     }
-                    ParsedLog::Eof => {
-                        if saw_eof || last_data_bytes != 1_438_200 {
+                    ParsedLog::Eof { final_chunk_bytes } => {
+                        if saw_eof || captured_bytes.is_some() {
+                            let error = "EOF doppelt oder nach Capture-Abschluss empfangen".to_string();
+                            stream_error = Some(error.clone());
+                            emit(make_diagnostic(&error, EventLevel::Error));
+                            return;
+                        }
+                        if final_chunk_bytes > 0 {
+                            if let Err(error) = transferred_bytes.record_chunk(final_chunk_bytes) {
+                                let message = format!("Ungültiger finaler EOF-Chunk: {error:?}");
+                                stream_error = Some(message.clone());
+                                emit(make_diagnostic(&message, EventLevel::Error));
+                                return;
+                            }
+                        }
+                        if transferred_bytes.total() != 1_438_200 {
                             let error = "EOF vor vollständiger Datenübertragung oder doppelt empfangen".to_string();
                             stream_error = Some(error.clone());
                             emit(make_diagnostic(&error, EventLevel::Error));
@@ -349,16 +369,22 @@ impl ScannerAdapter for FakeScannerAdapter {
                         saw_eof = true;
                         step(emit, ScanState::Transferring, 90, "EOF bestätigt");
                     }
-                    ParsedLog::CaptureComplete { bytes } => {
-                        if !saw_eof || bytes != last_data_bytes || captured_bytes.is_some() {
-                            let error = format!("Capture-Endstand {bytes} ist nicht konsistent mit EOF/Datenstrom {last_data_bytes}");
+                    ParsedLog::CaptureComplete { total_bytes, terminal_status } => {
+                        if !saw_eof || terminal_status != 5 || captured_bytes.is_some() {
+                            let error = format!("Capture-Endstand vor EOF, mit falschem Status oder doppelt empfangen (terminal={terminal_status})");
                             stream_error = Some(error.clone());
                             emit(make_diagnostic(&error, EventLevel::Error));
                             return;
                         }
-                        captured_bytes = Some(bytes);
+                        if let Err(error) = transferred_bytes.verify_reported_total(total_bytes) {
+                            let message = format!("Capture-Gesamtstand nicht konsistent: {error:?}");
+                            stream_error = Some(message.clone());
+                            emit(make_diagnostic(&message, EventLevel::Error));
+                            return;
+                        }
+                        captured_bytes = Some(total_bytes);
                     }
-                    ParsedLog::TiffWritten => {
+                    ParsedLog::TiffWritten { path: _ } => {
                         if captured_bytes != Some(1_438_200) || saw_tiff {
                             let error = "TIFF-Meldung vor gültigem Capture-Endstand oder doppelt empfangen".to_string();
                             stream_error = Some(error.clone());
@@ -373,23 +399,33 @@ impl ScannerAdapter for FakeScannerAdapter {
                             "TIFF-Finalisierung bestätigt",
                         );
                     }
-                    ParsedLog::Unknown(message) => emit(AdapterStep {
+                    ParsedLog::ClientExit { code } => {
+                        if client_exit_code.replace(code).is_some() {
+                            let error = "Doppelte Client-Exitdiagnose".to_string();
+                            stream_error = Some(error.clone());
+                            emit(make_diagnostic(&error, EventLevel::Error));
+                        }
+                    }
+                    ParsedLog::ReadFailed { status, detail } => {
+                        let error = format!("sane_read fehlgeschlagen: Status {status} {detail}");
+                        stream_error = Some(error.clone());
+                        emit(make_diagnostic(&error, EventLevel::Error));
+                    }
+                    ParsedLog::Malformed { stream, line } => {
+                        let error = format!("Fehlerhafte bekannte Logmeldung auf {stream:?}: {line}");
+                        stream_error = Some(error.clone());
+                        emit(make_diagnostic(&error, EventLevel::Error));
+                    }
+                    ParsedLog::Unknown { stream, line } => emit(AdapterStep {
                         // Preserve this as a typed diagnostic, never as a lifecycle step.
                         state: None,
                         progress: 0,
-                        message: format!("Unbekannte Logmeldung ignoriert: {message}"),
+                        message: format!("Unbekannte {stream:?}-Diagnose ignoriert: {line}"),
                         level: EventLevel::Warning,
                         holder_status: None,
                     }),
                     }
                 }
-                ProcessEvent::Stderr(message) => emit(AdapterStep {
-                    state: None,
-                    progress: 0,
-                    message: format!("Prozessdiagnose (stderr): {message}"),
-                    level: EventLevel::Warning,
-                    holder_status: None,
-                }),
                 ProcessEvent::StdoutClosed
                 | ProcessEvent::StderrClosed
                 | ProcessEvent::Exited { .. }
@@ -415,12 +451,21 @@ impl ScannerAdapter for FakeScannerAdapter {
             return Err(ScanError::ProcessProtocol(error));
         }
         lifecycle.validate(&outcome)?;
+        if let (Some(client_code), ProcessOutcome::Exited(process_code)) =
+            (client_exit_code, &outcome)
+        {
+            if client_code != *process_code {
+                return Err(ScanError::ProcessProtocol(format!(
+                    "Client-Exitdiagnose {client_code} widerspricht OS-Exitstatus {process_code}"
+                )));
+            }
+        }
         if let Some(error) = stream_error {
             return Err(ScanError::InvalidDataStream(error));
         }
         if !saw_eof
-            || last_data_bytes != 1_438_200
-            || captured_bytes != Some(last_data_bytes)
+            || transferred_bytes.total() != 1_438_200
+            || captured_bytes != Some(transferred_bytes.total())
             || !saw_tiff
         {
             return Err(ScanError::IncompleteStream);
@@ -522,10 +567,11 @@ mod tests {
                 Arc::new(AtomicBool::new(false)),
                 &mut |step| match step.state {
                     Some(state) => machine.transition(state).unwrap(),
-                    None => {
+                    None if step.message.starts_with("Unbekannte") => {
                         observed_unknown = true;
                         assert_eq!(machine.state(), ScanState::OpeningScanner);
                     }
+                    None => {}
                 },
             )
             .unwrap();
@@ -537,6 +583,29 @@ mod tests {
         machine.transition(ScanState::ClosingScanner).unwrap();
         assert_eq!(machine.state(), ScanState::ClosingScanner);
         assert!(machine.transition(ScanState::OpeningScanner).is_err());
+    }
+
+    #[test]
+    fn recorded_client_diagnostics_on_stderr_are_parsed_without_losing_stream_identity() {
+        let adapter = FakeScannerAdapter {
+            runner: Arc::new(RecordedProcessRunner::on_stream(LogStream::Stderr)),
+        };
+        let mut steps = Vec::new();
+        adapter
+            .scan(
+                &request(SimulationMode::Success),
+                Arc::new(AtomicBool::new(false)),
+                &mut |step| steps.push(step),
+            )
+            .unwrap();
+
+        assert!(steps
+            .iter()
+            .any(|step| step.message.contains("Datenchunk: 458752 Byte")));
+        assert!(steps.iter().any(|step| step
+            .message
+            .contains("Unbekannte Stderr-Diagnose ignoriert")));
+        assert_eq!(steps.last().unwrap().state, Some(ScanState::ClosingScanner));
     }
 
     #[test]
@@ -718,8 +787,8 @@ mod tests {
                 &mut |step| steps.push(step),
             )
             .unwrap();
-        assert!(steps
-            .iter()
-            .any(|step| step.message.contains("Unbekannte Logmeldung ignoriert")));
+        assert!(steps.iter().any(|step| step
+            .message
+            .contains("Unbekannte Stdout-Diagnose ignoriert")));
     }
 }

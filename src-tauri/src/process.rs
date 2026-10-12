@@ -1,4 +1,4 @@
-use crate::model::SimulationMode;
+use crate::{log_parser::LogStream, model::SimulationMode};
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -69,12 +69,24 @@ pub(crate) enum RecordedFault {
 #[derive(Default)]
 pub struct RecordedProcessRunner {
     fault: RecordedFault,
+    stream: Option<LogStream>,
 }
 
 impl RecordedProcessRunner {
     #[allow(dead_code)] // Test-only fault injection for lifecycle regression coverage.
     pub(crate) fn with_fault(fault: RecordedFault) -> Self {
-        Self { fault }
+        Self {
+            fault,
+            stream: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn on_stream(stream: LogStream) -> Self {
+        Self {
+            fault: RecordedFault::None,
+            stream: Some(stream),
+        }
     }
 }
 
@@ -115,10 +127,12 @@ impl ProcessRunner for RecordedProcessRunner {
             .position(|line| line.starts_with("sane_start"))
             .unwrap_or(0)
             + 1;
+        // Synthetic fake chunks chosen to preserve the former cumulative progress
+        // points 458752, 983040, 1438200. They are not Research hardware rows.
         for (offset, line) in [
             "sane_read -> 0 (Success), bytes=458752",
-            "sane_read -> 0 (Success), bytes=983040",
-            "sane_read -> 0 (Success), bytes=1438200",
+            "sane_read -> 0 (Success), bytes=524288",
+            "sane_read -> 0 (Success), bytes=455160",
         ]
         .into_iter()
         .enumerate()
@@ -130,7 +144,7 @@ impl ProcessRunner for RecordedProcessRunner {
                 .retain(|line| !line.contains("End of file reached") && !line.starts_with("TIFF "));
         }
         if matches!(self.fault, RecordedFault::IncompleteData) {
-            lines.retain(|line| !line.ends_with("bytes=1438200"));
+            lines.retain(|line| !line.ends_with("bytes=455160"));
         }
         if matches!(self.fault, RecordedFault::MissingTiff) {
             lines.retain(|line| !line.starts_with("TIFF "));
@@ -146,7 +160,10 @@ impl ProcessRunner for RecordedProcessRunner {
                 outcome = ProcessOutcome::Cancelled;
                 break;
             }
-            emit(ProcessEvent::Stdout(line));
+            match self.stream.unwrap_or(LogStream::Stdout) {
+                LogStream::Stdout => emit(ProcessEvent::Stdout(line)),
+                LogStream::Stderr => emit(ProcessEvent::Stderr(line)),
+            }
             stdout_events += 1;
             if matches!(self.fault, RecordedFault::CancelAfterStdout(after) if stdout_events == after)
             {
@@ -208,6 +225,7 @@ fn recorded_client_lines(frame: u8) -> Vec<String> {
                 || line.starts_with("sane_read")
                 || line.starts_with("capture ended")
                 || line.starts_with("TIFF ")
+                || line.starts_with("client exit ->")
         })
         .map(|line| {
             if line.starts_with("sane_control_option(frame, SET=") {
