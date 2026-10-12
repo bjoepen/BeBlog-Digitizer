@@ -54,6 +54,7 @@ pub struct BatchManifest {
 pub enum CaptureKind {
     Simulation,
     Production,
+    OfflineImport,
     UnclassifiedLegacy,
 }
 
@@ -98,6 +99,14 @@ pub struct CaptureProduct {
     pub kind: CaptureKind,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub struct OfflineCaptureProduct {
+    pub raw: Vec<u8>,
+    pub tiff: Vec<u8>,
+    pub params_txt: Vec<u8>,
+    pub client_log: Vec<u8>,
+}
+
 #[derive(Clone)]
 pub struct ArchiveManager {
     root: PathBuf,
@@ -111,6 +120,10 @@ enum BeginBatchError {
 impl ArchiveManager {
     pub fn new(root: PathBuf) -> Self {
         Self { root }
+    }
+
+    pub(crate) fn root_path(&self) -> &Path {
+        &self.root
     }
 
     #[cfg(test)]
@@ -132,7 +145,32 @@ impl ArchiveManager {
         request: &StartScanRequest,
         kind: CaptureKind,
     ) -> io::Result<PendingCapture> {
+        ensure_public_capture_kind(kind)?;
         self.begin_with_id(&Self::next_capture_id(), request, kind, None)
+    }
+
+    pub(crate) fn begin_offline_import(&self, frame: u8) -> io::Result<PendingCapture> {
+        if !(1..=4).contains(&frame) {
+            return Err(invalid_data(
+                "Offline-Import unterstützt in D3-B3a nur Frames 1–4",
+            ));
+        }
+        let request = StartScanRequest {
+            frame,
+            simulation: crate::model::SimulationMode::Success,
+        };
+        for _ in 0..BATCH_ID_ATTEMPTS {
+            let id = format!("offline-{}", uuid::Uuid::new_v4().simple());
+            match self.begin_with_id(&id, &request, CaptureKind::OfflineImport, None) {
+                Ok(pending) => return Ok(pending),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "Eindeutige Capture-ID nach mehreren Versuchen nicht verfügbar",
+        ))
     }
 
     pub fn begin_batch_frame(
@@ -141,6 +179,7 @@ impl ArchiveManager {
         request: &StartScanRequest,
         kind: CaptureKind,
     ) -> io::Result<PendingCapture> {
+        ensure_public_capture_kind(kind)?;
         self.begin_with_id(
             &Self::next_capture_id(),
             request,
@@ -279,6 +318,29 @@ impl ArchiveManager {
         pending: &PendingCapture,
         product: CaptureProduct,
     ) -> io::Result<CaptureManifest> {
+        if product.kind != CaptureKind::Simulation {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Production-Finalisierung benötigt einen künftig typisierten Prozessnachweis",
+            ));
+        }
+        self.finalize_unchecked(pending, product)
+    }
+
+    #[cfg(test)]
+    fn finalize_for_archive_validator_test(
+        &self,
+        pending: &PendingCapture,
+        product: CaptureProduct,
+    ) -> io::Result<CaptureManifest> {
+        self.finalize_unchecked(pending, product)
+    }
+
+    fn finalize_unchecked(
+        &self,
+        pending: &PendingCapture,
+        product: CaptureProduct,
+    ) -> io::Result<CaptureManifest> {
         let result = self.finalize_inner(pending, product);
         if let Err(error) = &result {
             if let Err(mark_error) = self.mark(
@@ -309,6 +371,11 @@ impl ArchiveManager {
         if manifest.capture_kind != product.kind {
             return Err(invalid_data(
                 "Capture-Herkunft stimmt nicht mit Produkt überein",
+            ));
+        }
+        if product.kind == CaptureKind::OfflineImport {
+            return Err(invalid_data(
+                "Offline-Import muss den profilierten Vier-Artefaktpfad verwenden",
             ));
         }
         if product.expected_raw_bytes != manifest.expected_raw_bytes {
@@ -391,6 +458,41 @@ impl ArchiveManager {
                 recovered.push(manifest.capture_id);
             }
         }
+        let staging = self.root.join(".staging");
+        if let Ok(staging_metadata) = fs::symlink_metadata(&staging) {
+            if !staging_metadata.file_type().is_dir() {
+                return Err(invalid_data("Stagingpfad ist kein echtes Verzeichnis"));
+            }
+            for entry in fs::read_dir(&staging)? {
+                let directory = entry?.path();
+                let Ok(directory_metadata) = fs::symlink_metadata(&directory) else {
+                    continue;
+                };
+                let stage_manifest_path = directory.join("stage.json");
+                let stage_manifest_metadata = fs::symlink_metadata(&stage_manifest_path);
+                if !directory_metadata.file_type().is_dir()
+                    || !stage_manifest_metadata
+                        .as_ref()
+                        .is_ok_and(|metadata| metadata.file_type().is_file())
+                {
+                    continue;
+                }
+                let bytes = fs::read(stage_manifest_path)?;
+                let mut manifest: crate::offline_import::StagingManifest =
+                    serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+                if manifest.status == crate::offline_import::StagingStatus::InProgress {
+                    manifest.status = crate::offline_import::StagingStatus::Interrupted;
+                    manifest.failure =
+                        Some("Application ended before offline artifact validation".into());
+                    crate::offline_import::write_staging_manifest(&directory, &manifest)?;
+                    recovered.push(format!("staging:{}", manifest.capture_id));
+                }
+            }
+        } else if staging.exists() {
+            return Err(io::Error::other(
+                "Stagingpfad konnte nicht untersucht werden",
+            ));
+        }
         let batches = self.root.join("batches");
         if batches.exists() {
             for entry in fs::read_dir(batches)? {
@@ -409,6 +511,75 @@ impl ArchiveManager {
             }
         }
         Ok(recovered)
+    }
+
+    pub(crate) fn finalize_offline_import(
+        &self,
+        pending: &PendingCapture,
+        product: OfflineCaptureProduct,
+    ) -> io::Result<CaptureManifest> {
+        let result = self.finalize_offline_inner(pending, product);
+        if let Err(error) = &result {
+            if let Err(mark_error) = self.mark(
+                pending,
+                ArchiveStatus::Failed,
+                format!("Offline-Import Finalisierung: {error}"),
+            ) {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("{error}; Fehlerstatus nicht persistiert: {mark_error}"),
+                ));
+            }
+        }
+        result
+    }
+
+    fn finalize_offline_inner(
+        &self,
+        pending: &PendingCapture,
+        product: OfflineCaptureProduct,
+    ) -> io::Result<CaptureManifest> {
+        let mut manifest = read_manifest(&pending.directory)?;
+        if manifest.status != ArchiveStatus::InProgress
+            || manifest.capture_kind != CaptureKind::OfflineImport
+        {
+            return Err(invalid_data("Capture ist kein offener Offline-Import"));
+        }
+        crate::offline_import::validate_artifact_bytes(
+            manifest.frame,
+            &product.raw,
+            &product.tiff,
+            &product.params_txt,
+            &product.client_log,
+        )?;
+        let artifacts = [
+            (
+                "capture.raw",
+                "application/x-beblog-raw",
+                product.raw.as_slice(),
+            ),
+            ("capture.tiff", "image/tiff", product.tiff.as_slice()),
+            (
+                "capture.params.txt",
+                "text/plain; profile=minolta-params",
+                product.params_txt.as_slice(),
+            ),
+            (
+                "capture.client.log",
+                "text/plain; profile=minolta-client-log",
+                product.client_log.as_slice(),
+            ),
+        ];
+        for (name, media_type, bytes) in artifacts {
+            manifest
+                .files
+                .push(write_original(&pending.directory, name, media_type, bytes)?);
+            write_manifest(&pending.directory, &manifest)?;
+        }
+        validate_manifest_files(&pending.directory, &manifest)?;
+        manifest.status = ArchiveStatus::Completed;
+        write_manifest(&pending.directory, &manifest)?;
+        Ok(manifest)
     }
 }
 
@@ -467,6 +638,16 @@ fn write_manifest(directory: &Path, manifest: &CaptureManifest) -> io::Result<()
 
 fn invalid_data(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+fn ensure_public_capture_kind(kind: CaptureKind) -> io::Result<()> {
+    if kind != CaptureKind::Simulation {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Produktions- und Offline-Captures benötigen ihren jeweils geprüften Importpfad",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_archive_id(id: &str) -> io::Result<()> {
@@ -646,6 +827,9 @@ fn validate_raw(bytes: &[u8], kind: CaptureKind) -> io::Result<()> {
             "Mock-RAW darf nicht als Produktionsscan archiviert werden",
         )),
         CaptureKind::Simulation | CaptureKind::Production => Ok(()),
+        CaptureKind::OfflineImport => Err(invalid_data(
+            "Offline-Import benötigt die profilierte Vier-Artefaktvalidierung",
+        )),
         CaptureKind::UnclassifiedLegacy => Err(invalid_data(
             "Unklassifizierte Altarchive dürfen nicht finalisiert werden",
         )),
@@ -687,6 +871,20 @@ mod tests {
             expected_raw_bytes,
             kind: CaptureKind::Production,
         }
+    }
+
+    fn begin_production_for_validator_test(
+        archive: &ArchiveManager,
+        request: &StartScanRequest,
+    ) -> PendingCapture {
+        archive
+            .begin_with_id(
+                &ArchiveManager::next_capture_id(),
+                request,
+                CaptureKind::Production,
+                None,
+            )
+            .unwrap()
     }
 
     fn valid_tiff() -> Vec<u8> {
@@ -785,9 +983,9 @@ mod tests {
     fn rejects_wrong_production_raw_size_and_marks_failed() {
         let root = temp_root("raw-invalid");
         let archive = ArchiveManager::new(root.clone());
-        let pending = archive.begin(&request(), CaptureKind::Production).unwrap();
+        let pending = begin_production_for_validator_test(&archive, &request());
         let error = archive
-            .finalize(
+            .finalize_for_archive_validator_test(
                 &pending,
                 production_product(vec![1, 2], valid_tiff(), 1_438_200),
             )
@@ -803,9 +1001,9 @@ mod tests {
     fn rejects_invalid_production_tiff_structure() {
         let root = temp_root("tiff-invalid");
         let archive = ArchiveManager::new(root.clone());
-        let pending = archive.begin(&request(), CaptureKind::Production).unwrap();
+        let pending = begin_production_for_validator_test(&archive, &request());
         let error = archive
-            .finalize(
+            .finalize_for_archive_validator_test(
                 &pending,
                 production_product(vec![1, 2], b"II*\0\xff\xff\xff\x7f".to_vec(), 2),
             )
@@ -822,15 +1020,41 @@ mod tests {
     fn accepts_structurally_valid_production_tiff_and_exact_raw_size() {
         let root = temp_root("production-valid");
         let archive = ArchiveManager::new(root.clone());
-        let pending = archive.begin(&request(), CaptureKind::Production).unwrap();
+        let pending = begin_production_for_validator_test(&archive, &request());
         let manifest = archive
-            .finalize(
+            .finalize_for_archive_validator_test(
                 &pending,
                 production_product(vec![7; 1_438_200], valid_tiff(), 1_438_200),
             )
             .unwrap();
         assert_eq!(manifest.status, ArchiveStatus::Completed);
         assert_eq!(manifest.files[0].bytes, 1_438_200);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn production_finalization_is_blocked_until_a_process_proof_api_exists() {
+        let root = temp_root("production-proof-required");
+        let archive = ArchiveManager::new(root.clone());
+        let pending = archive
+            .begin_with_id(
+                "validator-only-production",
+                &request(),
+                CaptureKind::Production,
+                None,
+            )
+            .unwrap();
+        let error = archive
+            .finalize(
+                &pending,
+                production_product(vec![7; 1_438_200], valid_tiff(), 1_438_200),
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            read_manifest(&pending.directory).unwrap().status,
+            ArchiveStatus::InProgress
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

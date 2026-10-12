@@ -1,8 +1,9 @@
 mod adapter;
-mod archive;
+pub mod archive;
 mod core;
 mod log_parser;
 mod model;
+pub mod offline_import;
 mod process;
 mod state_machine;
 
