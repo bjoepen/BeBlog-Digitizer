@@ -134,6 +134,11 @@ pub struct AppSnapshot {
 pub enum ScanError {
     Cancelled,
     TimedOut,
+    ProcessStartFailed(String),
     ProcessExit(i32),
+    ProcessCleanupFailed(String),
+    UnexpectedProcessEnd(String),
+    ProcessProtocol(String),
     IncompleteStream,
+    InvalidDataStream(String),
 }

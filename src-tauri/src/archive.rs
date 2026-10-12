@@ -281,11 +281,18 @@ impl ArchiveManager {
     ) -> io::Result<CaptureManifest> {
         let result = self.finalize_inner(pending, product);
         if let Err(error) = &result {
-            let _ = self.mark(
+            if let Err(mark_error) = self.mark(
                 pending,
                 ArchiveStatus::Failed,
                 format!("Finalisierung/Validierung: {error}"),
-            );
+            ) {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "{error}; Capturefehlerstatus konnte ebenfalls nicht persistiert werden: {mark_error}; Recovery erforderlich"
+                    ),
+                ));
+            }
         }
         result
     }
@@ -864,6 +871,22 @@ mod tests {
         assert_eq!(manifest.status, ArchiveStatus::Failed);
         assert_eq!(manifest.files.len(), 1);
         assert_eq!(manifest.files[0].name, "capture.raw");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn finalization_surfaces_a_secondary_archive_status_write_failure() {
+        let root = temp_root("finalize-status-error");
+        let archive = ArchiveManager::new(root.clone());
+        let pending = archive.begin(&request(), CaptureKind::Simulation).unwrap();
+        fs::write(pending.directory.join("manifest.json"), b"corrupt manifest").unwrap();
+
+        let error = archive.finalize(&pending, simulated_product()).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("Capturefehlerstatus konnte ebenfalls nicht persistiert werden"));
+        assert!(error.to_string().contains("Recovery erforderlich"));
         fs::remove_dir_all(root).unwrap();
     }
 

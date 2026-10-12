@@ -17,6 +17,9 @@ use std::{
 };
 use tauri::{AppHandle, Emitter};
 
+#[cfg(test)]
+use crate::process::RecordedFault;
+
 static NEXT_JOB: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Serialize)]
@@ -108,6 +111,16 @@ impl AppCore {
             adapter: Arc::new(FakeScannerAdapter::default()),
             archive: ArchiveManager::new(archive_root),
             clock,
+        }
+    }
+
+    #[cfg(test)]
+    fn new_with_recorded_fault(archive_root: std::path::PathBuf, fault: RecordedFault) -> Self {
+        Self {
+            data: Arc::new(Mutex::new(CoreData::default())),
+            adapter: Arc::new(FakeScannerAdapter::with_recorded_fault(fault)),
+            archive: ArchiveManager::new(archive_root),
+            clock: Arc::new(SystemBatchClock),
         }
     }
 
@@ -340,6 +353,7 @@ impl AppCore {
         let mut machine = ScanStateMachine::default();
         let _ = machine.transition(ScanState::AwaitingHolderConfirmation);
         let _ = machine.transition(ScanState::WaitingForHolderDetection);
+        let mut cancel_archive_note = String::new();
         for (index, frame) in request.frames.iter().copied().enumerate() {
             if cancelled.load(Ordering::SeqCst) {
                 break;
@@ -382,6 +396,13 @@ impl AppCore {
             let result = self
                 .adapter
                 .scan(&scan_request, cancelled.clone(), &mut |step| {
+                    if error_slot
+                        .lock()
+                        .expect("transition error mutex poisoned")
+                        .is_some()
+                    {
+                        return;
+                    }
                     if cancelled.load(Ordering::SeqCst) {
                         return;
                     }
@@ -435,9 +456,12 @@ impl AppCore {
                     emit_event(event);
                 });
             if cancelled.load(Ordering::SeqCst) {
-                let _ = self
+                cancel_archive_note = self
                     .archive
-                    .mark(&pending, ArchiveStatus::Cancelled, "Batch cancelled");
+                    .mark(&pending, ArchiveStatus::Cancelled, "Batch cancelled")
+                    .err()
+                    .map(|error| format!("; Capture-Abbruchstatus nicht gespeichert: {error}; Recovery erforderlich"))
+                    .unwrap_or_default();
                 break;
             }
             if let Some(error) = transition_error
@@ -445,15 +469,15 @@ impl AppCore {
                 .expect("transition error mutex poisoned")
                 .take()
             {
-                let _ = self.archive.mark(
+                let archive_note = self.archive.mark(
                     &pending,
                     ArchiveStatus::Failed,
                     format!("Invalid adapter transition: {error}"),
-                );
+                ).err().map(|mark_error| format!("; Capturefehlerstatus nicht gespeichert: {mark_error}; Recovery erforderlich")).unwrap_or_default();
                 self.end_batch_with_emitter(
                     &id,
                     ScanState::BatchFailed,
-                    format!("Frame {frame}: ungültiger Zustandsübergang: {error}"),
+                    format!("Frame {frame}: ungültiger Zustandsübergang: {error}{archive_note}"),
                     emit_event,
                 );
                 return;
@@ -461,15 +485,15 @@ impl AppCore {
             let product = match result {
                 Ok(p) if machine.state() == ScanState::ClosingScanner => p,
                 Ok(_) => {
-                    let _ = self.archive.mark(
+                    let archive_note = self.archive.mark(
                         &pending,
                         ArchiveStatus::Failed,
                         "Incomplete mock lifecycle",
-                    );
+                    ).err().map(|mark_error| format!("; Capturefehlerstatus nicht gespeichert: {mark_error}; Recovery erforderlich")).unwrap_or_default();
                     self.end_batch_with_emitter(
                         &id,
                         ScanState::BatchFailed,
-                        format!("Frame {frame}: unvollständiger Lifecycle"),
+                        format!("Frame {frame}: unvollständiger Lifecycle{archive_note}"),
                         emit_event,
                     );
                     return;
@@ -480,11 +504,14 @@ impl AppCore {
                     } else {
                         ArchiveStatus::Failed
                     };
-                    let _ = self.archive.mark(&pending, status, format!("{e:?}"));
+                    let archive_note = self.archive.mark(&pending, status, format!("{e:?}"))
+                        .err()
+                        .map(|mark_error| format!("; Capturefehlerstatus nicht gespeichert: {mark_error}; Recovery erforderlich"))
+                        .unwrap_or_default();
                     self.end_batch_with_emitter(
                         &id,
                         ScanState::BatchFailed,
-                        format!("Frame {frame} fehlgeschlagen: {e:?}"),
+                        format!("Frame {frame} fehlgeschlagen: {e:?}{archive_note}"),
                         emit_event,
                     );
                     return;
@@ -569,7 +596,9 @@ impl AppCore {
             self.end_batch_with_emitter(
                 &id,
                 ScanState::BatchCancelled,
-                "Batch abgebrochen; archivierte Frames bleiben erhalten".into(),
+                format!(
+                    "Batch abgebrochen; archivierte Frames bleiben erhalten{cancel_archive_note}"
+                ),
                 emit_event,
             );
         } else {
@@ -662,42 +691,53 @@ impl AppCore {
         cancelled: Arc<AtomicBool>,
         pending: PendingCapture,
     ) {
+        self.run_job_with_emitter(id, request, cancelled, pending, &mut |event| {
+            emit(&app, event)
+        });
+    }
+
+    fn run_job_with_emitter(
+        &self,
+        id: String,
+        request: StartScanRequest,
+        cancelled: Arc<AtomicBool>,
+        pending: PendingCapture,
+        emit_event: &mut dyn FnMut(ScanEvent),
+    ) {
         let mut machine = ScanStateMachine::default();
+        let mut transition_error = None;
         let result = self.adapter.scan(&request, cancelled.clone(), &mut |step| {
+            if transition_error.is_some() {
+                return;
+            }
             if cancelled.load(Ordering::SeqCst) {
-                emit(
-                    &app,
-                    ScanEvent::new(
-                        id.clone(),
-                        ScanState::Cancelling,
-                        self.current_progress(),
-                        "Adapter-Ereignis nach Abbruchanforderung ignoriert",
-                        EventLevel::Warning,
-                    ),
-                );
+                emit_event(ScanEvent::new(
+                    id.clone(),
+                    ScanState::Cancelling,
+                    self.current_progress(),
+                    "Adapter-Ereignis nach Abbruchanforderung ignoriert",
+                    EventLevel::Warning,
+                ));
                 return;
             }
             match step.state {
                 Some(next_state) => match machine.transition(next_state) {
-                    Ok(()) => self.record_and_emit(&app, &id, step),
+                    Ok(()) => self.record_and_emit_with_emitter(&id, step, emit_event),
                     Err(error) => {
+                        transition_error = Some(error.clone());
                         let current = self.snapshot().state;
-                        emit(
-                            &app,
-                            ScanEvent::new(
-                                id.clone(),
-                                current,
-                                self.current_progress(),
-                                format!("Ungültiger Adapter-Zustandsübergang verworfen: {error}"),
-                                EventLevel::Error,
-                            ),
-                        );
+                        emit_event(ScanEvent::new(
+                            id.clone(),
+                            current,
+                            self.current_progress(),
+                            format!("Ungültiger Adapter-Zustandsübergang verworfen: {error}"),
+                            EventLevel::Error,
+                        ));
                     }
                 },
                 None => {
                     let state = machine.state();
-                    emit(
-                        &app,
+                    emit_event(
                         ScanEvent::new(
                             id.clone(),
                             state,
@@ -711,7 +751,11 @@ impl AppCore {
             }
         });
 
-        let result = if cancelled.load(Ordering::SeqCst) {
+        let result = if let Some(error) = transition_error {
+            Err(ScanError::ProcessProtocol(format!(
+                "Ungültiger Adapter-Zustandsübergang: {error}"
+            )))
+        } else if cancelled.load(Ordering::SeqCst) {
             Err(ScanError::Cancelled)
         } else {
             result
@@ -750,52 +794,96 @@ impl AppCore {
             },
             Err(ScanError::Cancelled) => {
                 let _ = machine.transition(ScanState::Cancelling);
-                let _ = self.archive.mark(
-                    &pending,
-                    ArchiveStatus::Cancelled,
-                    "User requested cancellation",
-                );
+                let archive_note = self
+                    .archive
+                    .mark(
+                        &pending,
+                        ArchiveStatus::Cancelled,
+                        "User requested cancellation",
+                    )
+                    .err()
+                    .map(|error| {
+                        format!("; Archivstatus nicht gespeichert: {error}; Recovery erforderlich")
+                    })
+                    .unwrap_or_default();
                 (
                     ScanState::Cancelled,
                     self.current_progress(),
-                    "Scan kontrolliert abgebrochen".into(),
+                    format!("Scan kontrolliert abgebrochen{archive_note}"),
                     EventLevel::Warning,
                 )
             }
             Err(ScanError::TimedOut) => {
-                let _ =
-                    self.archive
-                        .mark(&pending, ArchiveStatus::TimedOut, "Mock process timeout");
+                let archive_note = self
+                    .archive
+                    .mark(&pending, ArchiveStatus::TimedOut, "Mock process timeout")
+                    .err()
+                    .map(|error| {
+                        format!("; Timeoutstatus nicht gespeichert: {error}; Recovery erforderlich")
+                    })
+                    .unwrap_or_default();
                 (
                     ScanState::TimedOut,
                     self.current_progress(),
-                    "Zeitüberschreitung des Mock-Prozesses".into(),
+                    format!("Zeitüberschreitung des Mock-Prozesses{archive_note}"),
                     EventLevel::Error,
                 )
             }
             Err(ScanError::ProcessExit(code)) => {
-                let _ = self.archive.mark(
-                    &pending,
-                    ArchiveStatus::Failed,
-                    format!("Process exit code {code}"),
-                );
+                let archive_note = self
+                    .archive
+                    .mark(
+                        &pending,
+                        ArchiveStatus::Failed,
+                        format!("Process exit code {code}"),
+                    )
+                    .err()
+                    .map(|error| {
+                        format!("; Fehlerstatus nicht gespeichert: {error}; Recovery erforderlich")
+                    })
+                    .unwrap_or_default();
                 (
                     ScanState::Failed,
                     self.current_progress(),
-                    format!("Mock-Prozess endete mit Exitcode {code}"),
+                    format!("Mock-Prozess endete mit Exitcode {code}{archive_note}"),
                     EventLevel::Error,
                 )
             }
             Err(ScanError::IncompleteStream) => {
-                let _ = self.archive.mark(
-                    &pending,
-                    ArchiveStatus::Failed,
-                    "Missing EOF, byte count, or TIFF confirmation",
-                );
+                let archive_note = self
+                    .archive
+                    .mark(
+                        &pending,
+                        ArchiveStatus::Failed,
+                        "Missing EOF, byte count, or TIFF confirmation",
+                    )
+                    .err()
+                    .map(|error| {
+                        format!("; Fehlerstatus nicht gespeichert: {error}; Recovery erforderlich")
+                    })
+                    .unwrap_or_default();
                 (
                     ScanState::Failed,
                     self.current_progress(),
-                    "Unvollständiger Datenstrom trotz Exitcode 0".into(),
+                    format!("Unvollständiger Datenstrom trotz Exitcode 0{archive_note}"),
+                    EventLevel::Error,
+                )
+            }
+            Err(error) => {
+                let archive_note = self
+                    .archive
+                    .mark(&pending, ArchiveStatus::Failed, format!("{error:?}"))
+                    .err()
+                    .map(|mark_error| {
+                        format!(
+                            "; Fehlerstatus nicht gespeichert: {mark_error}; Recovery erforderlich"
+                        )
+                    })
+                    .unwrap_or_default();
+                (
+                    ScanState::Failed,
+                    self.current_progress(),
+                    format!("Scan fehlgeschlagen: {error:?}{archive_note}"),
                     EventLevel::Error,
                 )
             }
@@ -809,23 +897,25 @@ impl AppCore {
             let terminal = ScanState::Failed;
             let progress = self.current_progress();
             self.finish_job(&id, terminal, progress);
-            emit(
-                &app,
-                ScanEvent::new(
-                    id,
-                    terminal,
-                    progress,
-                    format!("Inkonsistenter Jobabschluss wurde als Fehler markiert: {error}"),
-                    EventLevel::Error,
-                ),
-            );
+            emit_event(ScanEvent::new(
+                id,
+                terminal,
+                progress,
+                format!("Inkonsistenter Jobabschluss wurde als Fehler markiert: {error}"),
+                EventLevel::Error,
+            ));
             return;
         }
         self.finish_job(&id, terminal, progress);
-        emit(&app, ScanEvent::new(id, terminal, progress, message, level));
+        emit_event(ScanEvent::new(id, terminal, progress, message, level));
     }
 
-    fn record_and_emit(&self, app: &AppHandle, id: &str, step: AdapterStep) {
+    fn record_and_emit_with_emitter(
+        &self,
+        id: &str,
+        step: AdapterStep,
+        emit_event: &mut dyn FnMut(ScanEvent),
+    ) {
         let Some(state) = step.state else {
             return;
         };
@@ -840,8 +930,7 @@ impl AppCore {
                 job.state = state;
             }
         }
-        emit(
-            app,
+        emit_event(
             ScanEvent::new(
                 id.to_string(),
                 state,
@@ -1135,6 +1224,54 @@ mod tests {
     }
 
     #[test]
+    fn single_scan_transition_error_cannot_be_overwritten_by_later_progress() {
+        let root = std::env::temp_dir().join(format!("beblog-single-transition-{}", now_ms()));
+        let core = AppCore::new_with_recorded_fault(root.clone(), RecordedFault::StateRegression);
+        let id = "single-transition-regression".to_string();
+        let request = StartScanRequest {
+            frame: 1,
+            simulation: SimulationMode::Success,
+        };
+        let pending = core
+            .archive
+            .begin(&request, core.adapter.capture_kind())
+            .unwrap();
+        let capture_directory = pending.directory.clone();
+        {
+            let mut data = core.data.lock().unwrap();
+            data.active = Some(ActiveJob {
+                id: id.clone(),
+                cancelled: Arc::new(AtomicBool::new(false)),
+            });
+            data.state = ScanState::Initializing;
+        }
+
+        let mut events = Vec::new();
+        core.run_job_with_emitter(
+            id,
+            request,
+            Arc::new(AtomicBool::new(false)),
+            pending,
+            &mut |event| events.push(event),
+        );
+
+        assert_eq!(core.snapshot().state, ScanState::Failed);
+        assert_eq!(events.last().unwrap().state, ScanState::Failed);
+        assert!(events.iter().any(|event| event
+            .message
+            .contains("Ungültiger Adapter-Zustandsübergang")));
+        assert!(!events
+            .iter()
+            .any(|event| event.state == ScanState::ClosingScanner));
+        let manifest: crate::archive::CaptureManifest = serde_json::from_slice(
+            &std::fs::read(capture_directory.join("manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest.status, ArchiveStatus::Failed);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn cooldown_clock_is_injectable_and_counts_seconds() {
         let clock = CountingClock(AtomicU64::new(0));
         for _ in 0..30 {
@@ -1231,6 +1368,68 @@ mod tests {
         assert!(captures
             .iter()
             .all(|capture| capture.status == ArchiveStatus::Completed));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_first_process_does_not_retry_or_complete_the_batch() {
+        let root = std::env::temp_dir().join(format!("beblog-batch-start-error-{}", now_ms()));
+        let core = AppCore::new_with_recorded_fault(root.clone(), RecordedFault::StartFailure);
+        let id = "batch-no-retry-on-start-error".to_string();
+        let request = StartBatchRequest {
+            frames: vec![1, 2, 3, 4],
+            simulation: SimulationMode::Success,
+            failure_frame: None,
+        };
+        core.archive.begin_batch(&id, &request.frames).unwrap();
+        {
+            let mut data = core.data.lock().unwrap();
+            data.batch = Some(PendingBatch {
+                id: id.clone(),
+                request: request.clone(),
+                cancelled: Arc::new(AtomicBool::new(false)),
+                confirmed: true,
+                completed_frames: 0,
+                current_frame: Some(1),
+                cooldown_remaining: 0,
+            });
+            data.state = ScanState::WaitingForHolderDetection;
+        }
+
+        let mut events = Vec::new();
+        core.run_batch_with_emitter(
+            id.clone(),
+            request,
+            Arc::new(AtomicBool::new(false)),
+            &mut |event| events.push(event),
+        );
+
+        assert_eq!(core.snapshot().state, ScanState::BatchFailed);
+        assert_eq!(events.last().unwrap().state, ScanState::BatchFailed);
+        assert!(!events
+            .iter()
+            .any(|event| event.state == ScanState::BatchCompleted));
+        let last_frame_event = events
+            .iter()
+            .rposition(|event| event.message.contains("Prozessstart fehlgeschlagen"))
+            .unwrap();
+        assert_eq!(last_frame_event + 1, events.len() - 1);
+        let journal: crate::archive::BatchManifest = serde_json::from_slice(
+            &std::fs::read(root.join(format!("batches/{id}.json"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(journal.status, BatchArchiveStatus::Failed);
+        assert!(journal.completed_frames.is_empty());
+        let captures = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+            .filter(|entry| entry.path().join("manifest.json").is_file())
+            .count();
+        assert_eq!(
+            captures, 1,
+            "failed frame is not retried and later frames do not start"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
