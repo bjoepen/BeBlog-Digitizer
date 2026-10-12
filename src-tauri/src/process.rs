@@ -7,17 +7,37 @@ use std::{
     time::Duration,
 };
 
+// The OS runner is intentionally test-only in D3-B2. It can launch only this
+// crate's own test harness in fixed, harmless modes; D3-B3 must add a separately
+// reviewed production allowlist before any real sidecar can be started.
+#[cfg(test)]
+#[path = "os_process_runner.rs"]
+mod os_process_runner;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProcessEvent {
-    Started { program: &'static str },
+    Started {
+        program: &'static str,
+        /// Present only for operating-system processes; recorded processes have no PID.
+        pid: Option<u32>,
+    },
     StartFailed(String),
     Stdout(String),
     Stderr(String),
     StdoutClosed,
     StderrClosed,
-    Exited { code: i32 },
+    /// The child was waited/reaped; `None` means it ended without a numeric code.
+    Reaped {
+        code: Option<i32>,
+    },
+    Exited {
+        code: i32,
+    },
     Cancelled,
     TimedOut,
+    /// The graceful termination window expired and the child had to be killed.
+    #[allow(dead_code)] // Constructed only by the D3-B2 test-only OS runner.
+    ForcedKill,
     UnexpectedEnd(String),
     CleanedUp,
     CleanupFailed(String),
@@ -58,6 +78,7 @@ pub(crate) enum RecordedFault {
     StartFailure,
     CleanupFailure,
     MissingCleanupEvent,
+    MissingReapedEvent,
     IncompleteData,
     MissingTiff,
     StateRegression,
@@ -112,6 +133,7 @@ impl ProcessRunner for RecordedProcessRunner {
 
         emit(ProcessEvent::Started {
             program: "recorded-minolta-fixture",
+            pid: None,
         });
         let mut outcome = ProcessOutcome::Exited(0);
         let mut lines = recorded_client_lines(request.frame);
@@ -182,16 +204,24 @@ impl ProcessRunner for RecordedProcessRunner {
         emit(ProcessEvent::StderrClosed);
         if matches!(self.fault, RecordedFault::UnexpectedEnd) {
             let message = "recorded process ended without an exit status".to_string();
-            emit(ProcessEvent::UnexpectedEnd(message.clone()));
             outcome = ProcessOutcome::UnexpectedEnd(message);
         }
-        match outcome {
-            ProcessOutcome::Exited(code) => emit(ProcessEvent::Exited { code }),
+        if !matches!(self.fault, RecordedFault::MissingReapedEvent) {
+            emit(ProcessEvent::Reaped {
+                code: match &outcome {
+                    ProcessOutcome::Exited(code) => Some(*code),
+                    _ => None,
+                },
+            });
+        }
+        match &outcome {
+            ProcessOutcome::Exited(code) => emit(ProcessEvent::Exited { code: *code }),
             ProcessOutcome::Cancelled => emit(ProcessEvent::Cancelled),
             ProcessOutcome::TimedOut => emit(ProcessEvent::TimedOut),
-            ProcessOutcome::StartFailed(_)
-            | ProcessOutcome::UnexpectedEnd(_)
-            | ProcessOutcome::CleanupFailed(_) => {}
+            ProcessOutcome::UnexpectedEnd(message) => {
+                emit(ProcessEvent::UnexpectedEnd(message.clone()));
+            }
+            ProcessOutcome::StartFailed(_) | ProcessOutcome::CleanupFailed(_) => {}
         }
         if matches!(self.fault, RecordedFault::LateOutput) {
             emit(ProcessEvent::Stdout(
@@ -303,11 +333,17 @@ mod tests {
             .iter()
             .position(|e| matches!(e, ProcessEvent::Exited { code: 0 }))
             .unwrap();
+        let reaped = events
+            .iter()
+            .position(|e| matches!(e, ProcessEvent::Reaped { code: Some(0) }))
+            .unwrap();
         let cleaned = events
             .iter()
             .position(|e| *e == ProcessEvent::CleanedUp)
             .unwrap();
-        assert!(stdout_closed < exited && stderr_closed < exited && exited < cleaned);
+        assert!(
+            stdout_closed < reaped && stderr_closed < reaped && reaped < exited && exited < cleaned
+        );
         assert_eq!(outcome, ProcessOutcome::Exited(0));
     }
 

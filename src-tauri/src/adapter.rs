@@ -58,6 +58,8 @@ struct ProcessLifecycle {
     started: bool,
     stdout_closed: bool,
     stderr_closed: bool,
+    reaped: bool,
+    reaped_code: Option<i32>,
     terminal: Option<ObservedTerminal>,
     cleanup: CleanupOutcome,
 }
@@ -87,6 +89,7 @@ impl ProcessLifecycle {
             ProcessEvent::Started { .. } if !self.started && before_terminal => {
                 self.started = true;
             }
+            ProcessEvent::ForcedKill if self.started && before_terminal => {}
             ProcessEvent::StartFailed(message) if !self.started && before_terminal => {
                 self.terminal = Some(ObservedTerminal::StartFailed(message.clone()));
                 self.cleanup = CleanupOutcome::NotRequired;
@@ -103,8 +106,23 @@ impl ProcessLifecycle {
             {
                 self.stderr_closed = true;
             }
+            ProcessEvent::Reaped { code }
+                if self.started
+                    && self.stdout_closed
+                    && self.stderr_closed
+                    && !self.reaped
+                    && before_terminal =>
+            {
+                self.reaped = true;
+                self.reaped_code = *code;
+            }
             ProcessEvent::Exited { code }
-                if self.started && self.stdout_closed && self.stderr_closed && before_terminal =>
+                if self.started
+                    && self.stdout_closed
+                    && self.stderr_closed
+                    && self.reaped
+                    && self.reaped_code == Some(*code)
+                    && before_terminal =>
             {
                 self.terminal = Some(ObservedTerminal::Exited(*code));
             }
@@ -129,6 +147,7 @@ impl ProcessLifecycle {
             }
             ProcessEvent::CleanedUp
                 if self.started
+                    && self.reaped
                     && !matches!(
                         self.cleanup,
                         CleanupOutcome::Complete | CleanupOutcome::Failed(_)
@@ -258,7 +277,7 @@ impl ScannerAdapter for FakeScannerAdapter {
                     return;
                 }
                 match event {
-                ProcessEvent::Started { program } => emit(AdapterStep {
+                ProcessEvent::Started { program, .. } => emit(AdapterStep {
                     state: Some(ScanState::Initializing),
                     progress: 2,
                     message: format!("Mock-Prozess gestartet: {program}"),
@@ -428,9 +447,11 @@ impl ScannerAdapter for FakeScannerAdapter {
                 }
                 ProcessEvent::StdoutClosed
                 | ProcessEvent::StderrClosed
+                | ProcessEvent::Reaped { .. }
                 | ProcessEvent::Exited { .. }
                 | ProcessEvent::Cancelled
                 | ProcessEvent::TimedOut
+                | ProcessEvent::ForcedKill
                 | ProcessEvent::UnexpectedEnd(_) => {}
                 ProcessEvent::CleanedUp => step(
                     emit,
@@ -662,6 +683,17 @@ mod tests {
     #[test]
     fn success_outcome_without_cleanup_event_is_rejected() {
         let result = FakeScannerAdapter::with_recorded_fault(RecordedFault::MissingCleanupEvent)
+            .scan(
+                &request(SimulationMode::Success),
+                Arc::new(AtomicBool::new(false)),
+                &mut |_| {},
+            );
+        assert!(matches!(result, Err(ScanError::ProcessProtocol(_))));
+    }
+
+    #[test]
+    fn exit_event_without_successful_reaping_evidence_is_rejected() {
+        let result = FakeScannerAdapter::with_recorded_fault(RecordedFault::MissingReapedEvent)
             .scan(
                 &request(SimulationMode::Success),
                 Arc::new(AtomicBool::new(false)),
