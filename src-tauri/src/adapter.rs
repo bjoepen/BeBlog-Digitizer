@@ -1,7 +1,7 @@
 use crate::{
     archive::{CaptureKind, CaptureProduct},
     log_parser::{ParsedLog, SidecarLogParser},
-    model::{EventLevel, ScanError, ScanState, StartScanRequest},
+    model::{EventLevel, HolderStatus, ScanError, ScanState, SimulationMode, StartScanRequest},
     process::{ProcessEvent, ProcessOutcome, ProcessRequest, ProcessRunner, RecordedProcessRunner},
 };
 use std::{
@@ -14,6 +14,7 @@ pub struct AdapterStep {
     pub progress: u8,
     pub message: String,
     pub level: EventLevel,
+    pub holder_status: Option<HolderStatus>,
 }
 
 pub trait ScannerAdapter: Send + Sync + 'static {
@@ -71,6 +72,7 @@ impl ScannerAdapter for FakeScannerAdapter {
                     progress: 2,
                     message: format!("Mock-Prozess gestartet: {program}"),
                     level: EventLevel::Info,
+                    holder_status: Some(HolderStatus::Unknown),
                 }),
                 ProcessEvent::Stdout(line) => match parser.parse(&line) {
                     ParsedLog::Initialized => step(
@@ -86,15 +88,21 @@ impl ScannerAdapter for FakeScannerAdapter {
                         "Scanneröffnung bestätigt",
                     ),
                     ParsedLog::HolderDetected => {
-                        step(emit, ScanState::WaitingForHolder, 20, "Filmhalter erkannt");
-                        step(
-                            emit,
-                            ScanState::ConfiguringFrame,
-                            28,
-                            "Frame, RGB8 und 600 dpi konfiguriert",
+                        let mut holder_step = make_step(
+                            ScanState::WaitingForHolder,
+                            20,
+                            "Filmhalter erkannt",
+                            EventLevel::Info,
                         );
+                        holder_step.holder_status = Some(HolderStatus::Detected);
+                        emit(holder_step);
                     }
-                    ParsedLog::FrameConfigured => {}
+                    ParsedLog::FrameConfigured => step(
+                        emit,
+                        ScanState::PositioningFrame,
+                        26,
+                        "Framepositionierung bestätigt",
+                    ),
                     ParsedLog::ScanOptionConfigured => step(
                         emit,
                         ScanState::ConfiguringFrame,
@@ -102,7 +110,8 @@ impl ScannerAdapter for FakeScannerAdapter {
                         "Scanoption bestätigt",
                     ),
                     ParsedLog::ScanStarted => {
-                        step(emit, ScanState::StartingScan, 34, "Scanstart bestätigt")
+                        step(emit, ScanState::StartingScan, 32, "Scanstart bestätigt");
+                        step(emit, ScanState::Scanning, 34, "Scan läuft");
                     }
                     ParsedLog::Data { bytes } => {
                         let progress = 40 + ((bytes.min(1_438_200) * 48 / 1_438_200) as u8);
@@ -111,6 +120,7 @@ impl ScannerAdapter for FakeScannerAdapter {
                             progress,
                             message: format!("Datenstrom: {bytes} / 1438200 Byte"),
                             level: EventLevel::Info,
+                            holder_status: None,
                         });
                     }
                     ParsedLog::Eof => {
@@ -132,6 +142,7 @@ impl ScannerAdapter for FakeScannerAdapter {
                         progress: if saw_eof { 92 } else { 16 },
                         message: format!("Unbekannte Logmeldung ignoriert: {message}"),
                         level: EventLevel::Warning,
+                        holder_status: None,
                     }),
                 },
                 ProcessEvent::Stderr(message) => emit(AdapterStep {
@@ -139,11 +150,15 @@ impl ScannerAdapter for FakeScannerAdapter {
                     progress: 45,
                     message: format!("Mock-Prozess stderr: {message}"),
                     level: EventLevel::Error,
+                    holder_status: None,
                 }),
-                ProcessEvent::Exited { .. }
-                | ProcessEvent::Cancelled
-                | ProcessEvent::TimedOut
-                | ProcessEvent::CleanedUp => {}
+                ProcessEvent::Exited { .. } | ProcessEvent::Cancelled | ProcessEvent::TimedOut => {}
+                ProcessEvent::CleanedUp => step(
+                    emit,
+                    ScanState::ClosingScanner,
+                    98,
+                    "Mock-Prozess bereinigt und Scannerverbindung geschlossen",
+                ),
             });
 
         match outcome {
@@ -155,23 +170,35 @@ impl ScannerAdapter for FakeScannerAdapter {
         if !saw_eof || captured_bytes != Some(1_438_200) || !saw_tiff {
             return Err(ScanError::IncompleteStream);
         }
-        let raw = b"BEBLOG-MOCK-RAW\nsource=research-009-recorded-log\n".to_vec();
+        let raw = match request.simulation {
+            SimulationMode::MissingOutput => Vec::new(),
+            _ => b"BEBLOG-MOCK-RAW\nsource=synthetic-recorded-process\n".to_vec(),
+        };
         Ok(CaptureProduct {
             expected_raw_bytes: 1_438_200,
             raw,
-            tiff: b"BEBLOG-MOCK-TIFF\nnot-a-production-image\n".to_vec(),
+            tiff: match request.simulation {
+                SimulationMode::InvalidOutput => b"invalid-tiff".to_vec(),
+                SimulationMode::MissingOutput => Vec::new(),
+                _ => b"BEBLOG-MOCK-TIFF\nnot-a-production-image\n".to_vec(),
+            },
             kind: CaptureKind::Simulation,
         })
     }
 }
 
 fn step(emit: &mut dyn FnMut(AdapterStep), state: ScanState, progress: u8, message: &str) {
-    emit(AdapterStep {
+    emit(make_step(state, progress, message, EventLevel::Info));
+}
+
+fn make_step(state: ScanState, progress: u8, message: &str, level: EventLevel) -> AdapterStep {
+    AdapterStep {
         state,
         progress,
         message: message.into(),
-        level: EventLevel::Info,
-    });
+        level,
+        holder_status: None,
+    }
 }
 
 fn current_state_for_unknown(eof: bool) -> ScanState {
@@ -207,7 +234,13 @@ mod tests {
         assert!(steps
             .iter()
             .any(|step| step.message.contains("EOF bestätigt")));
-        assert_eq!(steps.last().unwrap().state, ScanState::Finalizing);
+        assert_eq!(steps.last().unwrap().state, ScanState::ClosingScanner);
+        assert!(steps
+            .iter()
+            .any(|step| step.holder_status == Some(HolderStatus::Unknown)));
+        assert!(steps
+            .iter()
+            .any(|step| step.holder_status == Some(HolderStatus::Detected)));
         let fixture = include_str!("../tests/fixtures/research-009-success.fixture");
         assert!(fixture.contains("capture ended: total=1438200"));
         assert!(fixture.contains("sane_start (only call)"));

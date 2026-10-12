@@ -3,19 +3,21 @@
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { onMount } from "svelte";
   import { applyScanEvent, initialSnapshot } from "./lib/state";
-  import type { AppSnapshot, ScanEvent, SimulationMode, StartScanRequest } from "./lib/types";
+  import type { AppSnapshot, ScanEvent, SimulationMode, StartBatchRequest } from "./lib/types";
 
   let snapshot: AppSnapshot = initialSnapshot;
-  let frame = 1;
   let simulation: SimulationMode = "success";
+  let failureFrame = 2;
   let events: ScanEvent[] = [];
   let commandError = "";
 
-  $: active = snapshot.activeJobId !== null;
+  $: active = snapshot.activeJobId !== null || snapshot.batch !== null;
   $: stateLabel = ({
     idle: "Bereit", initializing: "Initialisierung", openingScanner: "Scanner wird geöffnet",
-    waitingForHolder: "Warte auf Filmhalter", configuringFrame: "Frame wird konfiguriert",
-    startingScan: "Scan startet", transferring: "Datenübertragung", finalizing: "Dateien werden finalisiert",
+    waitingForHolder: "Warte auf Filmhalter", waitingForHolderDetection: "Haltererkennung",
+    awaitingHolderConfirmation: "Einlegen bestätigen", positioningFrame: "Frame wird positioniert", configuringFrame: "Frame wird konfiguriert",
+    startingScan: "Scan startet", scanning: "Scan läuft", transferring: "Datenübertragung", finalizing: "Dateien werden finalisiert", closingScanner: "Verbindung wird geschlossen", interFrameCooldown: "Bereitschaftspause",
+    batchCompleted: "Batch abgeschlossen", batchFailed: "Batch fehlgeschlagen", batchCancelled: "Batch abgebrochen",
     completed: "Abgeschlossen", cancelling: "Abbruch läuft", cancelled: "Abgebrochen",
     failed: "Fehler", timedOut: "Zeitüberschreitung"
   } as const)[snapshot.state];
@@ -35,21 +37,23 @@
     return () => { disposed = true; unlisten?.(); };
   });
 
-  async function startScan() {
+  async function startBatch() {
     commandError = "";
     events = [];
-    const request: StartScanRequest = { frame, simulation };
+    const request: StartBatchRequest = { frames: [1, 2, 3, 4], simulation, failureFrame: simulation === "success" ? null : failureFrame };
     try {
-      const jobId = await invoke<string>("start_scan", { request });
-      snapshot = { ...snapshot, scannerStatus: "busy", activeJobId: jobId, state: "initializing", progress: 0 };
+      const batchId = await invoke<string>("start_batch", { request });
+      snapshot = { ...snapshot, activeJobId: batchId, state: "awaitingHolderConfirmation", progress: 0, batch: { batchId, frames: [1,2,3,4], currentFrame: null, completedFrames: 0, totalFrames: 4, cooldownRemainingSeconds: 0, awaitingHolderConfirmation: true } };
     } catch (error) {
       commandError = String(error);
     }
   }
 
+  async function confirmHolder() { commandError = ""; try { await invoke("confirm_batch_holder"); } catch (error) { commandError = String(error); } }
+
   async function cancelScan() {
     commandError = "";
-    try { await invoke("cancel_scan"); }
+    try { await invoke(snapshot.batch ? "cancel_batch" : "cancel_scan"); }
     catch (error) { commandError = String(error); }
   }
 
@@ -76,6 +80,8 @@
     <div><span>Arbeitsstatus</span><strong>{stateLabel}</strong></div>
   </section>
 
+  {#if snapshot.recoveryNotices.length > 0}<p class="error-banner" role="status">Unterbrochene Archivdaten erkannt (keine automatische Wiederaufnahme): {snapshot.recoveryNotices.join(", ")}</p>{/if}
+
   <div class="workspace">
     <section class="card capture">
       <div class="section-heading">
@@ -85,22 +91,26 @@
 
       <div class="control-grid">
         <label>Frame
-          <select bind:value={frame} disabled={active}>
-            {#each [1, 2, 3, 4] as value}<option value={value}>Frame {value}</option>{/each}
-          </select>
+          <select disabled><option>Frames 1–4 · Reihenfolge</option></select>
         </label>
         <div class="parameter"><span>Farbe</span><strong>RGB8</strong></div>
         <div class="parameter"><span>Auflösung</span><strong>600 dpi</strong></div>
       </div>
 
-      <label class="scenario">Testszenario
+      <label class="scenario">Simulationsszenario
         <select bind:value={simulation} disabled={active}>
-          <option value="success">Research-009-Erfolg</option>
-          <option value="error">Simulierter Lesefehler</option>
-          <option value="timeout">Simulierter Halter-Timeout</option>
-          <option value="incomplete">Unvollständiger Datenstrom</option>
+          <option value="success">Erfolgreicher Vierer-Batch</option>
+          <option value="error">Prozessfehler</option><option value="timeout">Timeout</option>
+          <option value="incomplete">Unvollständiger Datenstrom</option><option value="missingOutput">Fehlende Ausgabe</option><option value="invalidOutput">Ungültige TIFF-Ausgabe</option>
         </select>
       </label>
+      {#if simulation !== "success"}<label class="scenario">Fehler in Frame <select bind:value={failureFrame} disabled={active}>{#each [2,3,4] as value}<option value={value}>{value}</option>{/each}</select></label>{/if}
+
+      <div class="holder-guide" aria-live="polite">
+        {#if !active}<p><strong>1 · Filmhalter mit vier Negativen vorbereiten.</strong> Der Scanner bleibt bis zum Start inaktiv.</p>
+        {:else if snapshot.state === "awaitingHolderConfirmation"}<p><strong>2 · Filmhalter jetzt einsetzen.</strong> Der Halter bleibt während des gesamten Batches eingesetzt.</p><button class="primary" on:click={confirmHolder}>Filmhalter eingesetzt – Batch freigeben</button>
+        {:else if snapshot.batch}<p><strong>Frame {snapshot.batch.currentFrame ?? 1} von {snapshot.batch.totalFrames}</strong> · {snapshot.batch.completedFrames} abgeschlossen</p>{#if snapshot.state === "interFrameCooldown"}<p class="countdown">Nächster Frame in {snapshot.batch.cooldownRemainingSeconds} Sekunden</p>{/if}{/if}
+      </div>
 
       <div class="progress-head"><span>{stateLabel}</span><strong>{snapshot.progress}%</strong></div>
       <div class="progress" aria-label="Scanfortschritt" aria-valuenow={snapshot.progress} role="progressbar">
@@ -110,8 +120,8 @@
       {#if commandError}<p class="error-banner" role="alert">{commandError}</p>{/if}
 
       <div class="actions">
-        <button class="primary" on:click={startScan} disabled={active}>Simulierten Scan starten</button>
-        <button class="secondary" on:click={cancelScan} disabled={!active}>Abbrechen</button>
+        <button class="primary" on:click={startBatch} disabled={active}>Vierer-Batch vorbereiten</button>
+        <button class="secondary" on:click={cancelScan} disabled={!active}>Batch abbrechen</button>
       </div>
     </section>
 

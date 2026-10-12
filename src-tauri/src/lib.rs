@@ -7,7 +7,7 @@ mod process;
 mod state_machine;
 
 use core::{AppCore, JobSummary};
-use model::{AppSnapshot, StartScanRequest};
+use model::{AppSnapshot, StartBatchRequest, StartScanRequest};
 use tauri::{AppHandle, Manager, State};
 
 #[tauri::command]
@@ -34,6 +34,25 @@ fn cancel_scan(app: AppHandle, core: State<'_, AppCore>) -> Result<(), String> {
     core.cancel(&app)
 }
 
+#[tauri::command]
+fn start_batch(
+    app: AppHandle,
+    core: State<'_, AppCore>,
+    request: StartBatchRequest,
+) -> Result<String, String> {
+    core.start_batch(&app, request)
+}
+
+#[tauri::command]
+fn confirm_batch_holder(app: AppHandle, core: State<'_, AppCore>) -> Result<(), String> {
+    core.confirm_batch_holder(app)
+}
+
+#[tauri::command]
+fn cancel_batch(app: AppHandle, core: State<'_, AppCore>) -> Result<(), String> {
+    core.cancel_batch(&app)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -48,7 +67,10 @@ pub fn run() {
             get_snapshot,
             list_jobs,
             start_scan,
-            cancel_scan
+            cancel_scan,
+            start_batch,
+            confirm_batch_holder,
+            cancel_batch
         ])
         .run(tauri::generate_context!())
         .expect("error while running BeBlog Digitizer");

@@ -1,4 +1,4 @@
-# BeBlog Digitizer – Build 001-B2
+# BeBlog Digitizer – Build 001-D1
 
 macOS-Anwendungsgrundgerüst mit Tauri v2, Svelte, TypeScript und einem ausschließlich simulierten Scanner-Adapter.
 
@@ -14,8 +14,8 @@ pnpm validate
 pnpm tauri dev
 ```
 
-Testszenarien `Research-009-Erfolg`, `Simulierter Lesefehler`, `Simulierter Halter-Timeout` und `Unvollständiger Datenstrom` sind in der Oberfläche auswählbar. Ein laufender Job kann kontrolliert abgebrochen werden.
+Die Oberfläche steuert einen simulierten Vierer-Batch. Fehler-/Timeout-/Ausgabeszenarien können gezielt Frame 2, 3 oder 4 zugeordnet werden. Ein Batch startet erst nach separater Filmhalterbestätigung und kann kontrolliert abgebrochen werden.
 
-Build 001-C ergänzt eine rein simulierte, typisierte Prozessschnittstelle und eine sichere Archivgrundlage. Details stehen in [docs/BUILD-001-C.md](docs/BUILD-001-C.md); die verbindliche Research-009-Korrektur in [docs/RESEARCH-009-CORRECTION.md](docs/RESEARCH-009-CORRECTION.md).
+Build 001-C ergänzt eine rein simulierte, typisierte Prozessschnittstelle und eine sichere Archivgrundlage. Build 001-D1 ergänzt einen geführten Vierer-Batch mit expliziter Halterbestätigung, Archivierung pro Frame und 30-Sekunden-Sperre zwischen erfolgreichen Frames. Details stehen in [docs/BUILD-001-C.md](docs/BUILD-001-C.md) und [docs/BUILD-001-D1.md](docs/BUILD-001-D1.md); die verbindliche Research-009-Korrektur in [docs/RESEARCH-009-CORRECTION.md](docs/RESEARCH-009-CORRECTION.md).
 
 Die Textfixture `src-tauri/tests/fixtures/research-009-success.fixture` enthält ausgewählte, nicht ausführbare Zeilen aus dem read-only Hardware-PASS-Protokoll. Es werden keine Research-Artefakte verändert oder zur Laufzeit benötigt.
