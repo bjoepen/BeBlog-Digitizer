@@ -10,7 +10,8 @@ use std::{
 };
 
 pub struct AdapterStep {
-    pub state: ScanState,
+    /// None denotes a diagnostic-only event which must not advance the lifecycle.
+    pub state: Option<ScanState>,
     pub progress: u8,
     pub message: String,
     pub level: EventLevel,
@@ -68,7 +69,7 @@ impl ScannerAdapter for FakeScannerAdapter {
             .runner
             .run(&process_request, cancelled, &mut |event| match event {
                 ProcessEvent::Started { program } => emit(AdapterStep {
-                    state: ScanState::Initializing,
+                    state: Some(ScanState::Initializing),
                     progress: 2,
                     message: format!("Mock-Prozess gestartet: {program}"),
                     level: EventLevel::Info,
@@ -116,7 +117,7 @@ impl ScannerAdapter for FakeScannerAdapter {
                     ParsedLog::Data { bytes } => {
                         let progress = 40 + ((bytes.min(1_438_200) * 48 / 1_438_200) as u8);
                         emit(AdapterStep {
-                            state: ScanState::Transferring,
+                            state: Some(ScanState::Transferring),
                             progress,
                             message: format!("Datenstrom: {bytes} / 1438200 Byte"),
                             level: EventLevel::Info,
@@ -138,15 +139,16 @@ impl ScannerAdapter for FakeScannerAdapter {
                         );
                     }
                     ParsedLog::Unknown(message) => emit(AdapterStep {
-                        state: current_state_for_unknown(saw_eof),
-                        progress: if saw_eof { 92 } else { 16 },
+                        // Preserve this as a typed diagnostic, never as a lifecycle step.
+                        state: None,
+                        progress: 0,
                         message: format!("Unbekannte Logmeldung ignoriert: {message}"),
                         level: EventLevel::Warning,
                         holder_status: None,
                     }),
                 },
                 ProcessEvent::Stderr(message) => emit(AdapterStep {
-                    state: ScanState::Transferring,
+                    state: Some(ScanState::Transferring),
                     progress: 45,
                     message: format!("Mock-Prozess stderr: {message}"),
                     level: EventLevel::Error,
@@ -193,19 +195,11 @@ fn step(emit: &mut dyn FnMut(AdapterStep), state: ScanState, progress: u8, messa
 
 fn make_step(state: ScanState, progress: u8, message: &str, level: EventLevel) -> AdapterStep {
     AdapterStep {
-        state,
+        state: Some(state),
         progress,
         message: message.into(),
         level,
         holder_status: None,
-    }
-}
-
-fn current_state_for_unknown(eof: bool) -> ScanState {
-    if eof {
-        ScanState::Transferring
-    } else {
-        ScanState::OpeningScanner
     }
 }
 
@@ -234,7 +228,7 @@ mod tests {
         assert!(steps
             .iter()
             .any(|step| step.message.contains("EOF bestätigt")));
-        assert_eq!(steps.last().unwrap().state, ScanState::ClosingScanner);
+        assert_eq!(steps.last().unwrap().state, Some(ScanState::ClosingScanner));
         assert!(steps
             .iter()
             .any(|step| step.holder_status == Some(HolderStatus::Unknown)));
@@ -244,6 +238,41 @@ mod tests {
         let fixture = include_str!("../tests/fixtures/research-009-success.fixture");
         assert!(fixture.contains("capture ended: total=1438200"));
         assert!(fixture.contains("sane_start (only call)"));
+    }
+
+    #[test]
+    fn complete_recorded_fake_event_sequence_preserves_strict_lifecycle() {
+        use crate::state_machine::ScanStateMachine;
+
+        let mut machine = ScanStateMachine::default();
+        machine
+            .transition(ScanState::AwaitingHolderConfirmation)
+            .unwrap();
+        machine
+            .transition(ScanState::WaitingForHolderDetection)
+            .unwrap();
+        let mut observed_unknown = false;
+        FakeScannerAdapter::default()
+            .scan(
+                &request(SimulationMode::Success),
+                Arc::new(AtomicBool::new(false)),
+                &mut |step| match step.state {
+                    Some(state) => machine.transition(state).unwrap(),
+                    None => {
+                        observed_unknown = true;
+                        assert_eq!(machine.state(), ScanState::OpeningScanner);
+                    }
+                },
+            )
+            .unwrap();
+
+        assert!(observed_unknown, "fixture diagnostic must be exercised");
+        assert_eq!(machine.state(), ScanState::ClosingScanner);
+        // Unknown messages do not create a duplicate Open transition, while the
+        // explicit duplicate-phase rule is exercised by known progress reports.
+        machine.transition(ScanState::ClosingScanner).unwrap();
+        assert_eq!(machine.state(), ScanState::ClosingScanner);
+        assert!(machine.transition(ScanState::OpeningScanner).is_err());
     }
 
     #[test]
