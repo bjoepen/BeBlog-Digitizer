@@ -10,6 +10,7 @@ use std::{
 };
 
 static CAPTURE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static BATCH_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 fn legacy_capture_kind() -> CaptureKind {
     CaptureKind::UnclassifiedLegacy
@@ -24,6 +25,27 @@ pub enum ArchiveStatus {
     Cancelled,
     TimedOut,
     Interrupted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BatchArchiveStatus {
+    InProgress,
+    Completed,
+    Failed,
+    Cancelled,
+    Interrupted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchManifest {
+    pub schema_version: u8,
+    pub batch_id: String,
+    pub frames: Vec<u8>,
+    pub status: BatchArchiveStatus,
+    pub completed_frames: Vec<u8>,
+    pub failure: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,6 +70,8 @@ pub struct FileMetadata {
 pub struct CaptureManifest {
     pub schema_version: u8,
     pub capture_id: String,
+    #[serde(default)]
+    pub batch_id: Option<String>,
     pub status: ArchiveStatus,
     #[serde(default = "legacy_capture_kind")]
     pub capture_kind: CaptureKind,
@@ -102,7 +126,68 @@ impl ArchiveManager {
         request: &StartScanRequest,
         kind: CaptureKind,
     ) -> io::Result<PendingCapture> {
-        self.begin_with_id(&Self::next_capture_id(), request, kind)
+        self.begin_with_id(&Self::next_capture_id(), request, kind, None)
+    }
+
+    pub fn begin_batch_frame(
+        &self,
+        batch_id: &str,
+        request: &StartScanRequest,
+        kind: CaptureKind,
+    ) -> io::Result<PendingCapture> {
+        self.begin_with_id(
+            &Self::next_capture_id(),
+            request,
+            kind,
+            Some(batch_id.to_string()),
+        )
+    }
+
+    pub fn begin_batch(&self, batch_id: &str, frames: &[u8]) -> io::Result<()> {
+        validate_archive_id(batch_id)?;
+        let directory = self.root.join("batches");
+        fs::create_dir_all(&directory)?;
+        let manifest = BatchManifest {
+            schema_version: 1,
+            batch_id: batch_id.into(),
+            frames: frames.to_vec(),
+            status: BatchArchiveStatus::InProgress,
+            completed_frames: Vec::new(),
+            failure: None,
+        };
+        let path = directory.join(format!("{batch_id}.json"));
+        let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+        serde_json::to_writer_pretty(&mut file, &manifest).map_err(io::Error::other)?;
+        file.write_all(b"\n")?;
+        file.sync_all()
+    }
+
+    pub fn update_batch(
+        &self,
+        batch_id: &str,
+        completed_frame: Option<u8>,
+        status: Option<BatchArchiveStatus>,
+        failure: Option<String>,
+    ) -> io::Result<()> {
+        validate_archive_id(batch_id)?;
+        let path = self.root.join("batches").join(format!("{batch_id}.json"));
+        let mut manifest: BatchManifest = serde_json::from_slice(&fs::read(&path)?)?;
+        if manifest.status != BatchArchiveStatus::InProgress {
+            return Err(invalid_data("Batchmanifest ist bereits terminal"));
+        }
+        if let Some(frame) = completed_frame {
+            if !manifest.frames.contains(&frame) || manifest.completed_frames.contains(&frame) {
+                return Err(invalid_data(
+                    "Ungültiger oder doppelter abgeschlossener Batch-Frame",
+                ));
+            }
+            manifest.completed_frames.push(frame);
+        }
+        if let Some(status) = status {
+            manifest.status = status;
+            manifest.failure = failure;
+        }
+        write_batch_manifest(&path, &manifest)
     }
 
     fn begin_with_id(
@@ -110,6 +195,7 @@ impl ArchiveManager {
         id: &str,
         request: &StartScanRequest,
         kind: CaptureKind,
+        batch_id: Option<String>,
     ) -> io::Result<PendingCapture> {
         fs::create_dir_all(&self.root)?;
         let directory = self.root.join(id);
@@ -117,6 +203,7 @@ impl ArchiveManager {
         let manifest = CaptureManifest {
             schema_version: 2,
             capture_id: id.to_string(),
+            batch_id,
             status: ArchiveStatus::InProgress,
             capture_kind: kind,
             frame: request.frame,
@@ -243,8 +330,38 @@ impl ArchiveManager {
                 recovered.push(manifest.capture_id);
             }
         }
+        let batches = self.root.join("batches");
+        if batches.exists() {
+            for entry in fs::read_dir(batches)? {
+                let path = entry?.path();
+                if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                    continue;
+                }
+                let mut manifest: BatchManifest = serde_json::from_slice(&fs::read(&path)?)?;
+                if manifest.status == BatchArchiveStatus::InProgress {
+                    manifest.status = BatchArchiveStatus::Interrupted;
+                    manifest.failure =
+                        Some("Application ended; batch is never resumed automatically".into());
+                    write_batch_manifest(&path, &manifest)?;
+                    recovered.push(manifest.batch_id);
+                }
+            }
+        }
         Ok(recovered)
     }
+}
+
+fn write_batch_manifest(path: &Path, manifest: &BatchManifest) -> io::Result<()> {
+    let sequence = BATCH_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temp = path.with_extension(format!("{}.{}.tmp", std::process::id(), sequence));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)?;
+    serde_json::to_writer_pretty(&mut file, manifest).map_err(io::Error::other)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    fs::rename(temp, path)
 }
 
 fn write_original(
@@ -289,6 +406,18 @@ fn write_manifest(directory: &Path, manifest: &CaptureManifest) -> io::Result<()
 
 fn invalid_data(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+fn validate_archive_id(id: &str) -> io::Result<()> {
+    if id.is_empty()
+        || id.len() > 96
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return Err(invalid_data("Ungültige Archiv-ID"));
+    }
+    Ok(())
 }
 
 fn validate_manifest_files(directory: &Path, manifest: &CaptureManifest) -> io::Result<()> {
@@ -512,11 +641,11 @@ mod tests {
         let root = temp_root("collision");
         let archive = ArchiveManager::new(root.clone());
         archive
-            .begin_with_id("fixed", &request(), CaptureKind::Simulation)
+            .begin_with_id("fixed", &request(), CaptureKind::Simulation, None)
             .unwrap();
         assert_eq!(
             archive
-                .begin_with_id("fixed", &request(), CaptureKind::Simulation)
+                .begin_with_id("fixed", &request(), CaptureKind::Simulation, None)
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::AlreadyExists
@@ -647,6 +776,24 @@ mod tests {
             read_manifest(&pending.directory).unwrap().status,
             ArchiveStatus::Interrupted
         );
+        assert!(archive.recover_incomplete().unwrap().is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovers_in_progress_batch_without_resuming_it() {
+        let root = temp_root("batch-recovery");
+        let archive = ArchiveManager::new(root.clone());
+        archive.begin_batch("batch-fixed", &[1, 2, 3, 4]).unwrap();
+        archive
+            .update_batch("batch-fixed", Some(1), None, None)
+            .unwrap();
+        assert_eq!(archive.recover_incomplete().unwrap(), vec!["batch-fixed"]);
+        let manifest: BatchManifest =
+            serde_json::from_slice(&fs::read(root.join("batches/batch-fixed.json")).unwrap())
+                .unwrap();
+        assert_eq!(manifest.status, BatchArchiveStatus::Interrupted);
+        assert_eq!(manifest.completed_frames, vec![1]);
         assert!(archive.recover_incomplete().unwrap().is_empty());
         fs::remove_dir_all(root).unwrap();
     }

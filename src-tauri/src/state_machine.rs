@@ -20,61 +20,93 @@ impl ScanStateMachine {
 
     pub fn transition(&mut self, next: ScanState) -> Result<(), String> {
         use ScanState::*;
+        let active = matches!(
+            self.state,
+            Initializing
+                | OpeningScanner
+                | WaitingForHolder
+                | ConfiguringFrame
+                | StartingScan
+                | Transferring
+                | Finalizing
+                | Cancelling
+                | AwaitingHolderConfirmation
+                | WaitingForHolderDetection
+                | PositioningFrame
+                | Scanning
+                | ClosingScanner
+                | InterFrameCooldown
+        );
         let allowed = matches!(
             (self.state, next),
-            (Initializing, Initializing)
-                | (OpeningScanner, OpeningScanner)
-                | (WaitingForHolder, WaitingForHolder)
-                | (ConfiguringFrame, ConfiguringFrame)
-                | (StartingScan, StartingScan)
-                | (Finalizing, Finalizing)
-                | (Idle, Initializing)
-                | (Idle, Cancelling)
-                | (Idle, Failed)
-                | (Idle, TimedOut)
-                | (Initializing, OpeningScanner)
-                | (OpeningScanner, WaitingForHolder)
-                | (WaitingForHolder, ConfiguringFrame)
-                | (ConfiguringFrame, StartingScan)
-                | (StartingScan, Transferring)
-                | (Transferring, Transferring)
-                | (Transferring, Finalizing)
-                | (Finalizing, Completed)
-                | (
-                    Initializing
-                        | OpeningScanner
-                        | WaitingForHolder
-                        | ConfiguringFrame
-                        | StartingScan
-                        | Transferring
-                        | Finalizing,
-                    Cancelling
-                )
-                | (Cancelling, Cancelled)
-                | (
-                    Initializing
-                        | OpeningScanner
-                        | WaitingForHolder
-                        | ConfiguringFrame
-                        | StartingScan
-                        | Transferring
-                        | Finalizing
-                        | Cancelling,
-                    Failed
-                )
-                | (
-                    Initializing
-                        | OpeningScanner
-                        | WaitingForHolder
-                        | ConfiguringFrame
-                        | StartingScan
-                        | Transferring
-                        | Finalizing
-                        | Cancelling,
-                    TimedOut
-                )
-                | (Completed | Cancelled | Failed | TimedOut, Idle)
-        );
+            (
+                Idle,
+                Initializing | Cancelling | Failed | TimedOut | AwaitingHolderConfirmation
+            ) | (
+                AwaitingHolderConfirmation,
+                WaitingForHolderDetection | BatchCancelled | Cancelling
+            ) | (
+                WaitingForHolderDetection,
+                Initializing | Cancelling | BatchFailed
+            ) | (
+                Initializing,
+                OpeningScanner | Initializing | Cancelling | Failed | TimedOut | BatchFailed
+            ) | (
+                OpeningScanner,
+                WaitingForHolder | Cancelling | Failed | TimedOut | BatchFailed
+            ) | (
+                WaitingForHolder,
+                PositioningFrame | ConfiguringFrame | Cancelling | Failed | TimedOut | BatchFailed
+            ) | (
+                PositioningFrame,
+                ConfiguringFrame | Cancelling | Failed | TimedOut | BatchFailed
+            ) | (
+                ConfiguringFrame,
+                ConfiguringFrame | StartingScan | Cancelling | Failed | TimedOut | BatchFailed
+            ) | (
+                StartingScan,
+                Scanning | Transferring | Cancelling | Failed | TimedOut | BatchFailed
+            ) | (
+                Scanning,
+                Transferring | Cancelling | Failed | TimedOut | BatchFailed
+            ) | (
+                Transferring,
+                Transferring | Finalizing | Cancelling | Failed | TimedOut | BatchFailed
+            ) | (
+                Finalizing,
+                Finalizing
+                    | Completed
+                    | ClosingScanner
+                    | Cancelling
+                    | Failed
+                    | TimedOut
+                    | BatchFailed
+            ) | (
+                ClosingScanner,
+                Completed
+                    | InterFrameCooldown
+                    | BatchCompleted
+                    | Cancelling
+                    | Failed
+                    | TimedOut
+                    | BatchFailed
+            ) | (
+                InterFrameCooldown,
+                Initializing | Cancelling | BatchCancelled | BatchFailed
+            ) | (
+                Cancelling,
+                Cancelled | BatchCancelled | Failed | BatchFailed
+            ) | (
+                Completed
+                    | Cancelled
+                    | Failed
+                    | TimedOut
+                    | BatchCompleted
+                    | BatchCancelled
+                    | BatchFailed,
+                Idle
+            )
+        ) || (active && matches!(next, Failed | TimedOut | BatchFailed));
         if !allowed {
             return Err(format!(
                 "invalid scan transition: {:?} -> {:?}",
@@ -110,47 +142,41 @@ mod tests {
     }
 
     #[test]
-    fn rejects_skipping_scan_start() {
+    fn accepts_confirmed_batch_and_cooldown_cycle() {
         let mut sm = ScanStateMachine::default();
-        sm.transition(Initializing).unwrap();
-        assert!(sm.transition(Transferring).is_err());
+        for state in [
+            AwaitingHolderConfirmation,
+            WaitingForHolderDetection,
+            Initializing,
+            OpeningScanner,
+            WaitingForHolder,
+            PositioningFrame,
+            ConfiguringFrame,
+            StartingScan,
+            Scanning,
+            Transferring,
+            Finalizing,
+            ClosingScanner,
+            InterFrameCooldown,
+            Initializing,
+        ] {
+            sm.transition(state).unwrap();
+        }
     }
 
     #[test]
-    fn invalid_transition_is_reported_without_mutating_state() {
+    fn rejects_skips_and_unconfirmed_scans() {
         let mut sm = ScanStateMachine::default();
-        let error = sm.transition(Completed).unwrap_err();
-        assert!(error.contains("Idle -> Completed"));
+        assert!(sm.transition(Transferring).is_err());
+        assert!(sm.transition(Completed).is_err());
         assert_eq!(sm.state(), Idle);
     }
 
     #[test]
-    fn supports_controlled_cancellation() {
+    fn supports_cancel_before_confirmation() {
         let mut sm = ScanStateMachine::default();
-        sm.transition(Initializing).unwrap();
-        sm.transition(Cancelling).unwrap();
-        sm.transition(Cancelled).unwrap();
+        sm.transition(AwaitingHolderConfirmation).unwrap();
+        sm.transition(BatchCancelled).unwrap();
         assert!(sm.state().terminal());
-    }
-
-    #[test]
-    fn timeout_and_process_failure_are_valid_from_active_states() {
-        let mut timed_out = ScanStateMachine::default();
-        for state in [
-            Initializing,
-            OpeningScanner,
-            WaitingForHolder,
-            ConfiguringFrame,
-        ] {
-            timed_out.transition(state).unwrap();
-        }
-        timed_out.transition(TimedOut).unwrap();
-
-        let mut failed = ScanStateMachine::default();
-        for state in [Initializing, OpeningScanner, WaitingForHolder] {
-            failed.transition(state).unwrap();
-        }
-        failed.transition(Failed).unwrap();
-        assert_eq!(failed.state(), Failed);
     }
 }

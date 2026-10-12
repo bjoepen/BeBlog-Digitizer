@@ -1,7 +1,7 @@
 use crate::{
     archive::{CaptureKind, CaptureProduct},
     log_parser::{ParsedLog, SidecarLogParser},
-    model::{EventLevel, ScanError, ScanState, StartScanRequest},
+    model::{EventLevel, ScanError, ScanState, SimulationMode, StartScanRequest},
     process::{ProcessEvent, ProcessOutcome, ProcessRequest, ProcessRunner, RecordedProcessRunner},
 };
 use std::{
@@ -87,14 +87,13 @@ impl ScannerAdapter for FakeScannerAdapter {
                     ),
                     ParsedLog::HolderDetected => {
                         step(emit, ScanState::WaitingForHolder, 20, "Filmhalter erkannt");
-                        step(
-                            emit,
-                            ScanState::ConfiguringFrame,
-                            28,
-                            "Frame, RGB8 und 600 dpi konfiguriert",
-                        );
                     }
-                    ParsedLog::FrameConfigured => {}
+                    ParsedLog::FrameConfigured => step(
+                        emit,
+                        ScanState::PositioningFrame,
+                        26,
+                        "Framepositionierung bestätigt",
+                    ),
                     ParsedLog::ScanOptionConfigured => step(
                         emit,
                         ScanState::ConfiguringFrame,
@@ -102,7 +101,8 @@ impl ScannerAdapter for FakeScannerAdapter {
                         "Scanoption bestätigt",
                     ),
                     ParsedLog::ScanStarted => {
-                        step(emit, ScanState::StartingScan, 34, "Scanstart bestätigt")
+                        step(emit, ScanState::StartingScan, 32, "Scanstart bestätigt");
+                        step(emit, ScanState::Scanning, 34, "Scan läuft");
                     }
                     ParsedLog::Data { bytes } => {
                         let progress = 40 + ((bytes.min(1_438_200) * 48 / 1_438_200) as u8);
@@ -140,10 +140,13 @@ impl ScannerAdapter for FakeScannerAdapter {
                     message: format!("Mock-Prozess stderr: {message}"),
                     level: EventLevel::Error,
                 }),
-                ProcessEvent::Exited { .. }
-                | ProcessEvent::Cancelled
-                | ProcessEvent::TimedOut
-                | ProcessEvent::CleanedUp => {}
+                ProcessEvent::Exited { .. } | ProcessEvent::Cancelled | ProcessEvent::TimedOut => {}
+                ProcessEvent::CleanedUp => step(
+                    emit,
+                    ScanState::ClosingScanner,
+                    98,
+                    "Mock-Prozess bereinigt und Scannerverbindung geschlossen",
+                ),
             });
 
         match outcome {
@@ -155,11 +158,18 @@ impl ScannerAdapter for FakeScannerAdapter {
         if !saw_eof || captured_bytes != Some(1_438_200) || !saw_tiff {
             return Err(ScanError::IncompleteStream);
         }
-        let raw = b"BEBLOG-MOCK-RAW\nsource=research-009-recorded-log\n".to_vec();
+        let raw = match request.simulation {
+            SimulationMode::MissingOutput => Vec::new(),
+            _ => b"BEBLOG-MOCK-RAW\nsource=synthetic-recorded-process\n".to_vec(),
+        };
         Ok(CaptureProduct {
             expected_raw_bytes: 1_438_200,
             raw,
-            tiff: b"BEBLOG-MOCK-TIFF\nnot-a-production-image\n".to_vec(),
+            tiff: match request.simulation {
+                SimulationMode::InvalidOutput => b"invalid-tiff".to_vec(),
+                SimulationMode::MissingOutput => Vec::new(),
+                _ => b"BEBLOG-MOCK-TIFF\nnot-a-production-image\n".to_vec(),
+            },
             kind: CaptureKind::Simulation,
         })
     }
@@ -207,7 +217,7 @@ mod tests {
         assert!(steps
             .iter()
             .any(|step| step.message.contains("EOF bestätigt")));
-        assert_eq!(steps.last().unwrap().state, ScanState::Finalizing);
+        assert_eq!(steps.last().unwrap().state, ScanState::ClosingScanner);
         let fixture = include_str!("../tests/fixtures/research-009-success.fixture");
         assert!(fixture.contains("capture ended: total=1438200"));
         assert!(fixture.contains("sane_start (only call)"));

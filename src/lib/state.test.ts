@@ -20,4 +20,15 @@ describe("applyScanEvent", () => {
     expect(next.scannerStatus).toBe("ready");
     expect(next.activeJobId).toBeNull();
   });
+
+  it("keeps the batch lock and countdown visible during cooldown", () => {
+    const next = applyScanEvent(initialSnapshot, {
+      jobId: "batch-1", state: "interFrameCooldown", progress: 100,
+      message: "Bereitschaftspause", level: "info", timestampMs: 2,
+      batch: { batchId: "batch-1", frames: [1, 2, 3, 4], currentFrame: 1, completedFrames: 1, totalFrames: 4, cooldownRemainingSeconds: 30, awaitingHolderConfirmation: false }
+    });
+    expect(next.scannerStatus).toBe("busy");
+    expect(next.batch?.cooldownRemainingSeconds).toBe(30);
+    expect(next.activeJobId).toBe("batch-1");
+  });
 });
