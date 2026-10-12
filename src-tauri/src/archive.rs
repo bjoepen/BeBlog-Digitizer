@@ -11,6 +11,7 @@ use std::{
 
 static CAPTURE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static BATCH_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+const BATCH_ID_ATTEMPTS: usize = 16;
 
 fn legacy_capture_kind() -> CaptureKind {
     CaptureKind::UnclassifiedLegacy
@@ -102,6 +103,11 @@ pub struct ArchiveManager {
     root: PathBuf,
 }
 
+enum BeginBatchError {
+    Collision,
+    Io(io::Error),
+}
+
 impl ArchiveManager {
     pub fn new(root: PathBuf) -> Self {
         Self { root }
@@ -143,10 +149,46 @@ impl ArchiveManager {
         )
     }
 
+    #[cfg(test)]
     pub fn begin_batch(&self, batch_id: &str, frames: &[u8]) -> io::Result<()> {
-        validate_archive_id(batch_id)?;
+        match self.begin_batch_once(batch_id, frames) {
+            Ok(()) => Ok(()),
+            Err(BeginBatchError::Collision) => Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("Batchjournal-ID bereits vorhanden: {batch_id}"),
+            )),
+            Err(BeginBatchError::Io(error)) => Err(error),
+        }
+    }
+
+    pub fn begin_batch_unique(&self, frames: &[u8]) -> io::Result<String> {
+        self.begin_batch_unique_with(frames, || {
+            format!("batch-{}", uuid::Uuid::new_v4().simple())
+        })
+    }
+
+    fn begin_batch_unique_with<F>(&self, frames: &[u8], mut next_id: F) -> io::Result<String>
+    where
+        F: FnMut() -> String,
+    {
+        for _ in 0..BATCH_ID_ATTEMPTS {
+            let id = next_id();
+            match self.begin_batch_once(&id, frames) {
+                Ok(()) => return Ok(id),
+                Err(BeginBatchError::Collision) => continue,
+                Err(BeginBatchError::Io(error)) => return Err(error),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("Batchjournal-ID nach {BATCH_ID_ATTEMPTS} Versuchen nicht verfügbar"),
+        ))
+    }
+
+    fn begin_batch_once(&self, batch_id: &str, frames: &[u8]) -> Result<(), BeginBatchError> {
+        validate_archive_id(batch_id).map_err(BeginBatchError::Io)?;
         let directory = self.root.join("batches");
-        fs::create_dir_all(&directory)?;
+        fs::create_dir_all(&directory).map_err(BeginBatchError::Io)?;
         let manifest = BatchManifest {
             schema_version: 1,
             batch_id: batch_id.into(),
@@ -156,10 +198,22 @@ impl ArchiveManager {
             failure: None,
         };
         let path = directory.join(format!("{batch_id}.json"));
-        let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
-        serde_json::to_writer_pretty(&mut file, &manifest).map_err(io::Error::other)?;
-        file.write_all(b"\n")?;
-        file.sync_all()
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::AlreadyExists {
+                    BeginBatchError::Collision
+                } else {
+                    BeginBatchError::Io(error)
+                }
+            })?;
+        serde_json::to_writer_pretty(&mut file, &manifest)
+            .map_err(io::Error::other)
+            .map_err(BeginBatchError::Io)?;
+        file.write_all(b"\n").map_err(BeginBatchError::Io)?;
+        file.sync_all().map_err(BeginBatchError::Io)
     }
 
     pub fn update_batch(
@@ -649,6 +703,56 @@ mod tests {
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::AlreadyExists
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn batch_id_collision_retries_without_modifying_existing_journal() {
+        let root = temp_root("batch-id-collision");
+        let archive = ArchiveManager::new(root.clone());
+        archive.begin_batch("batch-existing", &[1, 2]).unwrap();
+        archive
+            .update_batch(
+                "batch-existing",
+                Some(1),
+                Some(BatchArchiveStatus::Failed),
+                Some("preserve this failure".into()),
+            )
+            .unwrap();
+        let journal = root.join("batches/batch-existing.json");
+        let original = fs::read(&journal).unwrap();
+        let mut candidates = ["batch-existing", "batch-new"].into_iter();
+
+        let allocated = archive
+            .begin_batch_unique_with(&[1, 2], || candidates.next().unwrap().to_string())
+            .unwrap();
+
+        assert_eq!(allocated, "batch-new");
+        assert_eq!(fs::read(journal).unwrap(), original);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn non_collision_filesystem_already_exists_error_is_not_retried() {
+        let root = temp_root("batch-id-filesystem-error");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("batches"), b"not a directory").unwrap();
+        let archive = ArchiveManager::new(root.clone());
+        let attempts = std::cell::Cell::new(0);
+
+        let error = archive
+            .begin_batch_unique_with(&[1, 2], || {
+                attempts.set(attempts.get() + 1);
+                "batch-candidate".into()
+            })
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            attempts.get(),
+            1,
+            "only create_new ID collisions are retried"
         );
         fs::remove_dir_all(root).unwrap();
     }

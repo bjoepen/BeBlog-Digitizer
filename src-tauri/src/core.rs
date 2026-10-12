@@ -222,12 +222,9 @@ impl AppCore {
         request: StartBatchRequest,
     ) -> Result<String, String> {
         validate_batch_request(&request)?;
-        let id = format!("batch-{:06}", NEXT_JOB.fetch_add(1, Ordering::Relaxed));
         let mut data = self.data.lock().map_err(|_| "Interner Zustandsfehler")?;
         ensure_idle(&data)?;
-        self.archive
-            .begin_batch(&id, &request.frames)
-            .map_err(|e| format!("Batchjournal konnte nicht angelegt werden: {e}"))?;
+        let id = self.create_unique_batch_journal(&request.frames)?;
         data.batch = Some(PendingBatch {
             id: id.clone(),
             request,
@@ -249,6 +246,12 @@ impl AppCore {
         drop(data);
         emit(app, event);
         Ok(id)
+    }
+
+    fn create_unique_batch_journal(&self, frames: &[u8]) -> Result<String, String> {
+        self.archive
+            .begin_batch_unique(frames)
+            .map_err(|error| format!("Batchjournal konnte nicht angelegt werden: {error}"))
     }
 
     pub fn confirm_batch_holder(&self, app: AppHandle) -> Result<(), String> {
@@ -1033,6 +1036,102 @@ mod tests {
             ..request
         };
         assert!(validate_batch_request(&bad_target).is_err());
+    }
+
+    #[test]
+    fn batch_ids_are_unique_across_core_instances_and_preserve_existing_archives() {
+        let root = std::env::temp_dir().join(format!("beblog-batch-id-restart-{}", now_ms()));
+        let archive = ArchiveManager::new(root.clone());
+
+        archive.begin_batch("batch-000001", &[1, 2]).unwrap();
+        archive
+            .update_batch(
+                "batch-000001",
+                Some(1),
+                Some(BatchArchiveStatus::Completed),
+                None,
+            )
+            .unwrap();
+        archive.begin_batch("batch-000002", &[1, 2]).unwrap();
+        archive
+            .update_batch(
+                "batch-000002",
+                None,
+                Some(BatchArchiveStatus::Failed),
+                Some("historical failure".into()),
+            )
+            .unwrap();
+        archive.begin_batch("batch-000003", &[1, 2]).unwrap();
+        assert_eq!(
+            archive.recover_incomplete().unwrap(),
+            vec!["batch-000003".to_string()]
+        );
+
+        let capture = archive
+            .begin(
+                &StartScanRequest {
+                    frame: 1,
+                    simulation: SimulationMode::Success,
+                },
+                crate::archive::CaptureKind::Simulation,
+            )
+            .unwrap();
+        archive
+            .finalize(
+                &capture,
+                crate::archive::CaptureProduct {
+                    raw: b"BEBLOG-MOCK-RAW\nexisting capture\n".to_vec(),
+                    tiff: b"BEBLOG-MOCK-TIFF\nexisting capture\n".to_vec(),
+                    expected_raw_bytes: 1_438_200,
+                    kind: crate::archive::CaptureKind::Simulation,
+                },
+            )
+            .unwrap();
+
+        let preserved_paths = [
+            root.join("batches/batch-000001.json"),
+            root.join("batches/batch-000002.json"),
+            root.join("batches/batch-000003.json"),
+            capture.directory.join("manifest.json"),
+            capture.directory.join("capture.raw"),
+            capture.directory.join("capture.tiff"),
+        ];
+        let preserved = preserved_paths
+            .iter()
+            .map(|path| std::fs::read(path).unwrap())
+            .collect::<Vec<_>>();
+
+        // Separate cores model independent application lifetimes sharing the same archive.
+        let first_lifetime = AppCore::new(root.clone());
+        let second_lifetime = AppCore::new(root.clone());
+        let first_id = first_lifetime
+            .create_unique_batch_journal(&[1, 2, 3, 4])
+            .unwrap();
+        let second_id = second_lifetime
+            .create_unique_batch_journal(&[1, 2, 3, 4])
+            .unwrap();
+
+        assert_ne!(first_id, second_id);
+        for (path, expected) in preserved_paths.iter().zip(preserved) {
+            assert_eq!(std::fs::read(path).unwrap(), expected, "{}", path.display());
+        }
+        assert_eq!(
+            serde_json::from_slice::<crate::archive::BatchManifest>(
+                &std::fs::read(root.join(format!("batches/{first_id}.json"))).unwrap()
+            )
+            .unwrap()
+            .status,
+            BatchArchiveStatus::InProgress
+        );
+        assert_eq!(
+            serde_json::from_slice::<crate::archive::BatchManifest>(
+                &std::fs::read(root.join(format!("batches/{second_id}.json"))).unwrap()
+            )
+            .unwrap()
+            .status,
+            BatchArchiveStatus::InProgress
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
