@@ -38,6 +38,7 @@ enum SafeTestProgram {
     SelfSignal,
     WaitForTermination,
     IgnoreTermination,
+    CloseStreamsIgnoreTermination,
 }
 
 impl SafeTestProgram {
@@ -55,6 +56,9 @@ impl SafeTestProgram {
             Self::SelfSignal => "beblog-safe-test:self-signal",
             Self::WaitForTermination => "beblog-safe-test:wait-for-termination",
             Self::IgnoreTermination => "beblog-safe-test:ignore-termination",
+            Self::CloseStreamsIgnoreTermination => {
+                "beblog-safe-test:close-streams-ignore-termination"
+            }
         }
     }
 
@@ -77,6 +81,9 @@ impl SafeTestProgram {
             }
             Self::IgnoreTermination => {
                 Some("process::os_process_runner::tests::child_ignore_termination")
+            }
+            Self::CloseStreamsIgnoreTermination => {
+                Some("process::os_process_runner::tests::child_close_streams_ignore_termination")
             }
         }
     }
@@ -258,7 +265,10 @@ impl ProcessRunner for OsProcessRunner {
             if let Some(reason) = &terminal_reason {
                 let grace_elapsed =
                     termination_started.is_some_and(|when| when.elapsed() >= TERMINATION_GRACE);
-                if !streams.all_closed() && grace_elapsed && !hard_kill_sent {
+                // Pipe EOF is independent of process lifetime: a child can close
+                // both descriptors and continue running. Escalate until OS exit
+                // has actually been observed, even when both readers are done.
+                if observed_status.is_none() && grace_elapsed && !hard_kill_sent {
                     hard_kill_sent = true;
                     forced_kill = true;
                     emit(ProcessEvent::ForcedKill);
@@ -348,7 +358,7 @@ impl ProcessRunner for OsProcessRunner {
             Ok(status) => Some(status),
             Err(error) => {
                 cleanup_errors.push(format!("Childprozess konnte nicht gereapt werden: {error}"));
-                observed_status
+                None
             }
         };
         for handle in reader_threads {
@@ -365,7 +375,14 @@ impl ProcessRunner for OsProcessRunner {
             emit(ProcessEvent::StderrClosed);
         }
 
+        // On Unix (including macOS), Rust documents that try_wait returning
+        // Some(status) has already reaped the PID. Keep that OS-level proof for
+        // the event even if the subsequent explicit wait reports an error; the
+        // wait error above still makes cleanup fail and can never emit CleanedUp.
+        #[cfg(unix)]
         let status = waited_status.or(observed_status);
+        #[cfg(not(unix))]
+        let status = waited_status;
         if let Some(status) = status.as_ref() {
             emit(ProcessEvent::Reaped {
                 code: status.code(),
@@ -646,6 +663,17 @@ mod tests {
                     thread::sleep(Duration::from_secs(1));
                 }
             }
+            "close-streams-ignore-termination" => {
+                #[cfg(unix)]
+                unsafe {
+                    libc::signal(libc::SIGTERM, libc::SIG_IGN);
+                    libc::close(libc::STDOUT_FILENO);
+                    libc::close(libc::STDERR_FILENO);
+                }
+                loop {
+                    thread::sleep(Duration::from_secs(1));
+                }
+            }
             _ => panic!("unrecognized test child mode"),
         }
         // Bypass libtest's own summary output so every captured byte comes from
@@ -677,6 +705,10 @@ mod tests {
     child_mode_test!(child_self_signal, "self-signal");
     child_mode_test!(child_wait_for_termination, "wait-for-termination");
     child_mode_test!(child_ignore_termination, "ignore-termination");
+    child_mode_test!(
+        child_close_streams_ignore_termination,
+        "close-streams-ignore-termination"
+    );
 
     fn run(
         program: SafeTestProgram,
@@ -925,6 +957,34 @@ mod tests {
         // A successfully reaped PID no longer exists in the OS process table.
         // SAFETY: PID came from this runner's child; signal 0 performs no delivery.
         assert_ne!(unsafe { libc::kill(pid as libc::pid_t, 0) }, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_escalates_after_streams_close_if_child_keeps_running() {
+        let started = Instant::now();
+        let (outcome, events) = run(
+            SafeTestProgram::CloseStreamsIgnoreTermination,
+            Duration::from_millis(100),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert_eq!(outcome, ProcessOutcome::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(3), "runner hung");
+        assert!(events.contains(&ProcessEvent::StdoutClosed));
+        assert!(events.contains(&ProcessEvent::StderrClosed));
+        let kill = events
+            .iter()
+            .position(|event| *event == ProcessEvent::ForcedKill)
+            .expect("SIGKILL escalation should be reported");
+        let reaped = events
+            .iter()
+            .position(|event| matches!(event, ProcessEvent::Reaped { .. }))
+            .expect("killed child should be reaped");
+        let cleanup = events
+            .iter()
+            .position(|event| *event == ProcessEvent::CleanedUp)
+            .expect("readers and process resources should be cleaned up");
+        assert!(kill < reaped && reaped < cleanup);
     }
 
     #[test]
