@@ -383,7 +383,12 @@ pub(crate) fn validate_artifact_bytes(
     }
     let params = parse_params(params_txt)?;
     validate_profile_metadata(&params, frame)?;
-    validate_tiff_profile(tiff)?;
+    let tiff_pixels = validate_tiff_profile(tiff)?;
+    if tiff.get(tiff_pixels) != Some(raw) {
+        return Err(invalid_data(
+            "TIFF-Pixelbytes stimmen nicht mit den zugehörigen RAW-Bytes überein",
+        ));
+    }
     validate_log_profile(frame, client_log)?;
     Ok(())
 }
@@ -697,7 +702,7 @@ impl<'a> TiffReader<'a> {
     }
 }
 
-fn validate_tiff_profile(bytes: &[u8]) -> io::Result<()> {
+fn validate_tiff_profile(bytes: &[u8]) -> io::Result<std::ops::Range<usize>> {
     if bytes.len() < 8 {
         return Err(invalid_data("TIFF-Header unvollständig"));
     }
@@ -850,8 +855,10 @@ fn validate_tiff_profile(bytes: &[u8]) -> io::Result<()> {
         .ok_or_else(|| invalid_data("TIFF StripByteCounts fehlt"))?
         .1
         .clone();
-    if offsets.len() != byte_counts.len() || offsets.is_empty() {
-        return Err(invalid_data("TIFF Strip-Arrays passen nicht zusammen"));
+    if offsets.len() != 1 || byte_counts.len() != 1 {
+        return Err(invalid_data(
+            "Das unterstützte RGB8-Profil benötigt genau einen TIFF-Strip",
+        ));
     }
     let mut image_ranges = Vec::new();
     let mut total = 0_u64;
@@ -885,7 +892,10 @@ fn validate_tiff_profile(bytes: &[u8]) -> io::Result<()> {
             "TIFF-Strips enthalten nicht genau das RGB8-RAW-Profil",
         ));
     }
-    Ok(())
+    image_ranges
+        .into_iter()
+        .next()
+        .ok_or_else(|| invalid_data("TIFF-Bilddaten fehlen"))
 }
 
 pub(crate) fn write_staging_manifest(
@@ -893,11 +903,20 @@ pub(crate) fn write_staging_manifest(
     manifest: &StagingManifest,
 ) -> io::Result<()> {
     let bytes = serde_json::to_vec_pretty(manifest).map_err(io::Error::other)?;
-    let temporary = directory.join(format!("stage-{}.tmp", std::process::id()));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)?;
+    // Each attempted journal write gets a fresh exclusive name. If the process
+    // died during an earlier write, its partial file is deliberately preserved.
+    let (temporary, mut file) = loop {
+        let candidate = directory.join(format!(".stage-{}.tmp", uuid::Uuid::new_v4().simple()));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => break (candidate, file),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    };
     file.write_all(&bytes)?;
     file.write_all(b"\n")?;
     file.sync_all()?;
@@ -946,7 +965,7 @@ mod tests {
         bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
     }
 
-    fn tiff(compression: u16, corrupt_ifd: bool, truncate: bool) -> Vec<u8> {
+    fn tiff(raw: &[u8], compression: u16, corrupt_ifd: bool, truncate: bool) -> Vec<u8> {
         // Minimal little-endian, one-strip, uncompressed RGB TIFF for the fixed profile.
         let tags: [(u16, u16, u32, u32); 11] = [
             (256, 4, 1, WIDTH),
@@ -995,6 +1014,7 @@ mod tests {
         put16(&mut bytes, sample_format_at, 1);
         put16(&mut bytes, sample_format_at + 2, 1);
         put16(&mut bytes, sample_format_at + 4, 1);
+        bytes[data_at..data_at + RAW_BYTES].copy_from_slice(raw);
         if corrupt_ifd {
             put32(&mut bytes, 4, u32::MAX);
         }
@@ -1037,7 +1057,7 @@ mod tests {
         let sources = write_sources(
             &source_root,
             &raw,
-            &tiff(1, false, false),
+            &tiff(&raw, 1, false, false),
             &params(),
             &log(),
         );
@@ -1070,12 +1090,30 @@ mod tests {
     }
 
     #[test]
+    fn requires_tiff_pixels_to_match_the_associated_raw_bytes() {
+        let raw = vec![42; RAW_BYTES];
+        let mut matching_tiff = tiff(&raw, 1, false, false);
+        assert!(validate_artifact_bytes(1, &raw, &matching_tiff, &params(), &log()).is_ok());
+
+        let pixel_range = validate_tiff_profile(&matching_tiff).unwrap();
+        matching_tiff[pixel_range.start + 123] ^= 1;
+        assert!(validate_artifact_bytes(1, &raw, &matching_tiff, &params(), &log()).is_err());
+
+        let matching_tiff = tiff(&raw, 1, false, false);
+        let mut changed_raw = raw;
+        changed_raw[123] ^= 1;
+        assert!(
+            validate_artifact_bytes(1, &changed_raw, &matching_tiff, &params(), &log()).is_err()
+        );
+    }
+
+    #[test]
     fn rejects_missing_files_wrong_raw_size_and_inconsistent_parameters() {
         let root = root();
         let archive = ArchiveManager::new(root.clone());
         let source = root.join("input");
         let good_raw = vec![1; RAW_BYTES];
-        let good_tiff = tiff(1, false, false);
+        let good_tiff = tiff(&good_raw, 1, false, false);
         let paths = write_sources(&source, &good_raw, &good_tiff, &params(), &log());
         fs::remove_file(&paths.client_log).unwrap();
         assert!(import_offline_artifacts(&archive, 1, &paths).is_err());
@@ -1107,7 +1145,7 @@ mod tests {
     #[test]
     fn rejects_bad_tiff_ifd_offsets_compression_and_truncated_pixels() {
         let raw = vec![1; RAW_BYTES];
-        let mut bad_strip_offset = tiff(1, false, false);
+        let mut bad_strip_offset = tiff(&raw, 1, false, false);
         let ifd = 8;
         let entry_count =
             u16::from_le_bytes([bad_strip_offset[ifd], bad_strip_offset[ifd + 1]]) as usize;
@@ -1118,9 +1156,9 @@ mod tests {
             }
         }
         for tiff_bytes in [
-            tiff(1, true, false),
-            tiff(5, false, false),
-            tiff(1, false, true),
+            tiff(&raw, 1, true, false),
+            tiff(&raw, 5, false, false),
+            tiff(&raw, 1, false, true),
             bad_strip_offset,
         ] {
             assert!(validate_artifact_bytes(1, &raw, &tiff_bytes, &params(), &log()).is_err());
@@ -1139,7 +1177,7 @@ mod tests {
                 &pending,
                 OfflineCaptureProduct {
                     raw: vec![9; RAW_BYTES],
-                    tiff: tiff(1, false, false),
+                    tiff: tiff(&vec![9; RAW_BYTES], 1, false, false),
                     params_txt: params(),
                     client_log: log(),
                 },
@@ -1179,7 +1217,7 @@ mod tests {
         let paths = write_sources(
             &input,
             &vec![1; RAW_BYTES],
-            &tiff(1, false, false),
+            &tiff(&vec![1; RAW_BYTES], 1, false, false),
             &params(),
             &log(),
         );
@@ -1196,13 +1234,18 @@ mod tests {
         let root = root();
         let archive = ArchiveManager::new(root.clone());
         let (_directory, manifest) = reserve_stage(&root).unwrap();
+        let stage_dir = root.join(".staging").join(&manifest.capture_id);
+        let abandoned_temp = stage_dir.join(format!("stage-{}.tmp", std::process::id()));
+        let abandoned_contents = b"partial journal from an interrupted write";
+        fs::write(&abandoned_temp, abandoned_contents).unwrap();
         let notices = archive.recover_incomplete().unwrap();
         assert_eq!(notices, vec![format!("staging:{}", manifest.capture_id)]);
-        let stage_dir = root.join(".staging").join(manifest.capture_id);
         let recovered: StagingManifest =
             serde_json::from_slice(&fs::read(stage_dir.join("stage.json")).unwrap()).unwrap();
         assert_eq!(recovered.status, StagingStatus::Interrupted);
+        assert_eq!(fs::read(&abandoned_temp).unwrap(), abandoned_contents);
         assert!(archive.recover_incomplete().unwrap().is_empty());
+        assert_eq!(fs::read(&abandoned_temp).unwrap(), abandoned_contents);
         fs::remove_dir_all(root).unwrap();
     }
 }

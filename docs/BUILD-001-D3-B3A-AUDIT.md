@@ -87,3 +87,13 @@ All import fixtures are synthetic. No Minolta client or scanner process, SANE co
 - **BLOCKER:** Define an unforgeable typed process result combining regular OS exit, reaping, stream completion, and cleanup result before enabling `CaptureKind::Production`.
 - **OPEN:** Decide whether successful `.staging` copies are retained, moved, or safely pruned after durable archive finalization.
 - **OPEN:** Define archive quotas and caps if future client logs/TIFFs exceed the current 16 MiB/4 MiB bounds.
+
+## D3-B3a.1 Audit Corrections
+
+**PASS — Pixel-level RAW/TIFF consistency:** The strict validator now returns the validated single-strip TIFF pixel range after checking the accepted uncompressed RGB8 layout and exact profile byte count. Artifact validation compares that complete range byte-for-byte with the associated RAW data. Structural TIFF validity alone can no longer accept altered pixels. Regression coverage accepts identical synthetic pixels and rejects a one-byte mutation independently in either the TIFF pixels or RAW file.
+
+**PASS — Crash-safe staging journal temporary files:** Journal updates now create a fresh UUID-named temporary file with exclusive `create_new` semantics for each attempt. A temporary file left by an interrupted write is not reused, overwritten, or deleted; recovery ignores that uncommitted temporary and writes the interrupted status through a new unique file. A regression test leaves a PID-style partial temp file in place, runs recovery, and confirms its bytes remain unchanged while the stage becomes `interrupted`.
+
+These changes affect only offline artifact validation and staging metadata. No production scanner activation, scanner process, SANE, Homebrew, Research artifact, or Minolta client was used or modified.
+
+**D3-B3a.1 verification:** `cargo test --manifest-path src-tauri/Cargo.toml` PASS (79 passed, 12 intentionally ignored); `cargo fmt --manifest-path src-tauri/Cargo.toml --check` PASS; `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings` PASS; `pnpm check` PASS; `pnpm test` PASS (7/7); `pnpm build` PASS; `pnpm tauri build --bundles app` PASS (native macOS app bundle). `git diff --check` PASS. Tests/build were hardware-free; no scanner-related executables were started.
