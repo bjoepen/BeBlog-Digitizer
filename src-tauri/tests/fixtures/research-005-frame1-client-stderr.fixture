@@ -1,0 +1,34 @@
+# VERBATIM EXCERPT; not a complete process transcript.
+# Source: ~/Minolta-Research-005-PASS/scan-results/frame1.client.log
+# Source SHA-256: aab64424b860ba3f98d529ca5fbaf4714955048f893f8174b0dde6cb3a20bd6d
+# Included source line ranges: 1-5, 42-57, 141-148. Intermediate read calls are omitted.
+# These are client diagnostics mirrored to stderr by diag() in minolta-batch-frame.c.
+[2026-10-11T08:31:35.712] client start; device=avision:libusb:002:006 timeout=120 interval=2 SANE_DEBUG_AVISION=7
+[2026-10-11T08:31:35.713] batch mode: film holder remains inserted; requested frame=1
+[2026-10-11T08:31:35.713] sane_init -> 0 (Success)
+[2026-10-11T08:31:35.713] SANE version code=0x1040000
+[2026-10-11T08:31:55.350] sane_open (only call) -> 0 (Success)
+[2026-10-11T08:31:55.470] holder poll 1: sane_control_option(frame, GET) -> 0 (Success), value=1, info=0x0
+[2026-10-11T08:31:55.470] holder poll 1: frame descriptor range=1..6 quant=1
+[2026-10-11T08:31:55.470] wait_for_holder -> 0 (Success)
+[2026-10-11T08:31:55.486] sane_control_option(frame, SET=1) -> 0 (Success), info=0x0
+[2026-10-11T08:31:55.486] sane_get_option_descriptor(mode) -> descriptor
+[2026-10-11T08:31:55.486] sane_control_option(mode, SET='Color') -> 0 (Success), info=0x6
+[2026-10-11T08:31:55.486] sane_control_option(resolution, SET=600) -> 0 (Success), info=0x4
+[2026-10-11T08:31:55.487] sane_get_parameters(before start) -> 0 (Success)
+[2026-10-11T08:31:55.487] parameters(pre): format=RGB last=1 bpl=1692 pixels=564 lines=850 depth=8
+[2026-10-11T08:31:55.942] sane_start (only call) -> 0 (Success)
+[2026-10-11T08:31:55.942] sane_get_parameters(after start) -> 0 (Success)
+[2026-10-11T08:31:55.942] parameters(post): format=RGB last=1 bpl=1692 pixels=564 lines=850 depth=8
+[2026-10-11T08:31:58.774] sane_read -> 0 (Success), bytes=16384
+[2026-10-11T08:31:58.878] sane_read -> 0 (Success), bytes=16384
+[2026-10-11T08:31:58.974] sane_read -> 0 (Success), bytes=16384
+[2026-10-11T08:31:59.078] sane_read -> 0 (Success), bytes=16384
+[2026-10-11T08:32:09.862] sane_read -> 0 (Success), bytes=12792
+[2026-10-11T08:32:09.862] sane_read -> 5 (End of file reached), bytes=0
+[2026-10-11T08:32:09.863] capture ended: total=1438200 terminal=5 (End of file reached)
+[2026-10-11T08:32:09.863] metadata /Users/bernd/minolta-batch-20261011-083132/frame1.params.txt -> written
+[2026-10-11T08:32:09.870] TIFF /Users/bernd/minolta-batch-20261011-083132/frame1.tiff -> written
+[2026-10-11T08:32:09.870] sane_close
+[2026-10-11T08:32:09.871] sane_exit
+[2026-10-11T08:32:09.871] client exit -> 0 (Success)
