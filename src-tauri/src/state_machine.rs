@@ -107,7 +107,25 @@ impl ScanStateMachine {
                 Idle
             )
         ) || (active && matches!(next, Failed | TimedOut | BatchFailed));
-        if !allowed {
+        // Repeated, recognized phase notifications are harmless progress updates.
+        // This is deliberately limited to active phases; terminal and unrelated
+        // backwards transitions remain rejected.
+        let repeated_progress = self.state == next
+            && matches!(
+                next,
+                Initializing
+                    | OpeningScanner
+                    | WaitingForHolder
+                    | PositioningFrame
+                    | ConfiguringFrame
+                    | StartingScan
+                    | Scanning
+                    | Transferring
+                    | Finalizing
+                    | ClosingScanner
+                    | InterFrameCooldown
+            );
+        if !allowed && !repeated_progress {
             return Err(format!(
                 "invalid scan transition: {:?} -> {:?}",
                 self.state, next

@@ -324,6 +324,16 @@ impl AppCore {
         request: StartBatchRequest,
         cancelled: Arc<AtomicBool>,
     ) {
+        self.run_batch_with_emitter(id, request, cancelled, &mut |event| emit(&app, event));
+    }
+
+    fn run_batch_with_emitter(
+        &self,
+        id: String,
+        request: StartBatchRequest,
+        cancelled: Arc<AtomicBool>,
+        emit_event: &mut dyn FnMut(ScanEvent),
+    ) {
         let mut machine = ScanStateMachine::default();
         let _ = machine.transition(ScanState::AwaitingHolderConfirmation);
         let _ = machine.transition(ScanState::WaitingForHolderDetection);
@@ -355,11 +365,11 @@ impl AppCore {
             ) {
                 Ok(p) => p,
                 Err(e) => {
-                    self.end_batch(
-                        &app,
+                    self.end_batch_with_emitter(
                         &id,
                         ScanState::BatchFailed,
                         format!("Archivstart fehlgeschlagen: {e}"),
+                        emit_event,
                     );
                     return;
                 }
@@ -372,50 +382,54 @@ impl AppCore {
                     if cancelled.load(Ordering::SeqCst) {
                         return;
                     }
-                    if let Err(error) = machine.transition(step.state) {
-                        *error_slot.lock().expect("transition error mutex poisoned") =
-                            Some(error.clone());
-                        let current = machine.state();
-                        emit(
-                            &app,
-                            ScanEvent::new(
-                                id.clone(),
-                                current,
-                                self.current_progress(),
-                                format!(
+                    if let Some(next_state) = step.state {
+                        if let Err(error) = machine.transition(next_state) {
+                            *error_slot.lock().expect("transition error mutex poisoned") =
+                                Some(error.clone());
+                            let current = machine.state();
+                            emit_event(
+                                ScanEvent::new(
+                                    id.clone(),
+                                    current,
+                                    self.current_progress(),
+                                    format!(
                                     "Ungültiger Fake-Adapter-Übergang für Frame {frame}: {error}"
                                 ),
-                                EventLevel::Error,
-                            )
-                            .with_batch(
-                                self.batch_event(
-                                    current,
-                                    "Ungültiger Adapterzustand; Batch wird beendet",
                                     EventLevel::Error,
                                 )
-                                .batch
-                                .unwrap(),
-                            ),
-                        );
-                        return;
+                                .with_batch(
+                                    self.batch_event(
+                                        current,
+                                        "Ungültiger Adapterzustand; Batch wird beendet",
+                                        EventLevel::Error,
+                                    )
+                                    .batch
+                                    .unwrap(),
+                                ),
+                            );
+                            return;
+                        }
                     }
+                    let current_state = machine.state();
                     let mut data = self.data.lock().expect("core mutex poisoned");
-                    data.state = step.state;
-                    data.progress = step.progress;
+                    if let Some(next_state) = step.state {
+                        data.state = next_state;
+                        data.progress = step.progress;
+                    }
                     if let Some(holder_status) = step.holder_status {
                         data.holder_detected = holder_status == HolderStatus::Detected;
                     }
                     let event = ScanEvent::new(
                         id.clone(),
-                        step.state,
-                        step.progress,
+                        current_state,
+                        data.progress,
                         format!("Frame {frame}: {}", step.message),
                         step.level,
                     )
                     .with_batch(batch_snapshot(data.batch.as_ref().unwrap()))
                     .with_holder_status(step.holder_status);
                     drop(data);
-                    emit(&app, event);
+                    emit_event(event);
                 });
             if cancelled.load(Ordering::SeqCst) {
                 let _ = self
@@ -433,11 +447,11 @@ impl AppCore {
                     ArchiveStatus::Failed,
                     format!("Invalid adapter transition: {error}"),
                 );
-                self.end_batch(
-                    &app,
+                self.end_batch_with_emitter(
                     &id,
                     ScanState::BatchFailed,
                     format!("Frame {frame}: ungültiger Zustandsübergang: {error}"),
+                    emit_event,
                 );
                 return;
             }
@@ -449,11 +463,11 @@ impl AppCore {
                         ArchiveStatus::Failed,
                         "Incomplete mock lifecycle",
                     );
-                    self.end_batch(
-                        &app,
+                    self.end_batch_with_emitter(
                         &id,
                         ScanState::BatchFailed,
                         format!("Frame {frame}: unvollständiger Lifecycle"),
+                        emit_event,
                     );
                     return;
                 }
@@ -464,40 +478,40 @@ impl AppCore {
                         ArchiveStatus::Failed
                     };
                     let _ = self.archive.mark(&pending, status, format!("{e:?}"));
-                    self.end_batch(
-                        &app,
+                    self.end_batch_with_emitter(
                         &id,
                         ScanState::BatchFailed,
                         format!("Frame {frame} fehlgeschlagen: {e:?}"),
+                        emit_event,
                     );
                     return;
                 }
             };
             if let Err(e) = self.archive.finalize(&pending, product) {
-                self.end_batch(
-                    &app,
+                self.end_batch_with_emitter(
                     &id,
                     ScanState::BatchFailed,
                     format!("Frame {frame}: Ausgabe ungültig: {e}"),
+                    emit_event,
                 );
                 return;
             }
             if let Err(e) = self.archive.update_batch(&id, Some(frame), None, None) {
-                self.end_batch(
-                    &app,
+                self.end_batch_with_emitter(
                     &id,
                     ScanState::BatchFailed,
                     format!("Batchjournal konnte nicht aktualisiert werden: {e}"),
+                    emit_event,
                 );
                 return;
             }
             if index + 1 < request.frames.len() {
                 if machine.transition(ScanState::InterFrameCooldown).is_err() {
-                    self.end_batch(
-                        &app,
+                    self.end_batch_with_emitter(
                         &id,
                         ScanState::BatchFailed,
                         "Ungültiger Cooldown-Übergang".into(),
+                        emit_event,
                     );
                     return;
                 }
@@ -512,14 +526,11 @@ impl AppCore {
                         batch.cooldown_remaining = remaining;
                         data.state = ScanState::InterFrameCooldown;
                     }
-                    emit(
-                        &app,
-                        self.batch_event(
-                            ScanState::InterFrameCooldown,
-                            &format!("Bereitschaftspause: {remaining} Sekunden"),
-                            EventLevel::Info,
-                        ),
-                    );
+                    emit_event(self.batch_event(
+                        ScanState::InterFrameCooldown,
+                        &format!("Bereitschaftspause: {remaining} Sekunden"),
+                        EventLevel::Info,
+                    ));
                     self.clock.wait_second(&cancelled);
                 }
                 if cancelled.load(Ordering::SeqCst) {
@@ -528,11 +539,11 @@ impl AppCore {
                 let _ = machine.transition(ScanState::Initializing);
             } else {
                 if machine.transition(ScanState::BatchCompleted).is_err() {
-                    self.end_batch(
-                        &app,
+                    self.end_batch_with_emitter(
                         &id,
                         ScanState::BatchFailed,
                         "Batchabschluss-Zustand ungültig".into(),
+                        emit_event,
                     );
                     return;
                 }
@@ -552,23 +563,33 @@ impl AppCore {
                 let _ = machine.transition(ScanState::Cancelling);
             }
             let _ = machine.transition(ScanState::BatchCancelled);
-            self.end_batch(
-                &app,
+            self.end_batch_with_emitter(
                 &id,
                 ScanState::BatchCancelled,
                 "Batch abgebrochen; archivierte Frames bleiben erhalten".into(),
+                emit_event,
             );
         } else {
-            self.end_batch(
-                &app,
+            self.end_batch_with_emitter(
                 &id,
                 ScanState::BatchCompleted,
                 "Batch erfolgreich abgeschlossen".into(),
+                emit_event,
             );
         }
     }
 
     fn end_batch(&self, app: &AppHandle, id: &str, state: ScanState, message: String) {
+        self.end_batch_with_emitter(id, state, message, &mut |event| emit(app, event));
+    }
+
+    fn end_batch_with_emitter(
+        &self,
+        id: &str,
+        state: ScanState,
+        message: String,
+        emit_event: &mut dyn FnMut(ScanEvent),
+    ) {
         let (state, message) = self.persist_batch_terminal(id, state, message);
         let event = {
             let mut data = self.data.lock().expect("core mutex poisoned");
@@ -594,7 +615,7 @@ impl AppCore {
             event
         };
         if let Some(event) = event {
-            emit(app, event);
+            emit_event(event);
         }
     }
 
@@ -653,19 +674,35 @@ impl AppCore {
                 );
                 return;
             }
-            match machine.transition(step.state) {
-                Ok(()) => self.record_and_emit(&app, &id, step),
-                Err(error) => {
-                    let current = self.snapshot().state;
+            match step.state {
+                Some(next_state) => match machine.transition(next_state) {
+                    Ok(()) => self.record_and_emit(&app, &id, step),
+                    Err(error) => {
+                        let current = self.snapshot().state;
+                        emit(
+                            &app,
+                            ScanEvent::new(
+                                id.clone(),
+                                current,
+                                self.current_progress(),
+                                format!("Ungültiger Adapter-Zustandsübergang verworfen: {error}"),
+                                EventLevel::Error,
+                            ),
+                        );
+                    }
+                },
+                None => {
+                    let state = machine.state();
                     emit(
                         &app,
                         ScanEvent::new(
                             id.clone(),
-                            current,
+                            state,
                             self.current_progress(),
-                            format!("Ungültiger Adapter-Zustandsübergang verworfen: {error}"),
-                            EventLevel::Error,
-                        ),
+                            step.message,
+                            step.level,
+                        )
+                        .with_holder_status(step.holder_status),
                     );
                 }
             }
@@ -786,22 +823,25 @@ impl AppCore {
     }
 
     fn record_and_emit(&self, app: &AppHandle, id: &str, step: AdapterStep) {
+        let Some(state) = step.state else {
+            return;
+        };
         {
             let mut data = self.data.lock().expect("core mutex poisoned");
-            data.state = step.state;
+            data.state = state;
             data.progress = step.progress;
             if let Some(holder_status) = step.holder_status {
                 data.holder_detected = holder_status == HolderStatus::Detected;
             }
             if let Some(job) = data.jobs.iter_mut().find(|job| job.id == id) {
-                job.state = step.state;
+                job.state = state;
             }
         }
         emit(
             app,
             ScanEvent::new(
                 id.to_string(),
-                step.state,
+                state,
                 step.progress,
                 step.message,
                 step.level,
@@ -1002,6 +1042,97 @@ mod tests {
             clock.wait_second(&AtomicBool::new(false));
         }
         assert_eq!(clock.0.load(Ordering::SeqCst), 30);
+    }
+
+    #[test]
+    fn full_four_frame_fake_batch_completes_with_three_cooldowns_and_archive() {
+        let root = std::env::temp_dir().join(format!("beblog-four-frame-batch-{}", now_ms()));
+        let clock = Arc::new(CountingClock(AtomicU64::new(0)));
+        let core = AppCore::new_with_clock(root.clone(), clock.clone());
+        let batch_id = "batch-four-frame-regression".to_string();
+        let request = StartBatchRequest {
+            frames: vec![1, 2, 3, 4],
+            simulation: SimulationMode::Success,
+            failure_frame: None,
+        };
+        core.archive
+            .begin_batch(&batch_id, &request.frames)
+            .unwrap();
+        {
+            let mut data = core.data.lock().unwrap();
+            data.batch = Some(PendingBatch {
+                id: batch_id.clone(),
+                request: request.clone(),
+                cancelled: Arc::new(AtomicBool::new(false)),
+                confirmed: true,
+                completed_frames: 0,
+                current_frame: Some(1),
+                cooldown_remaining: 0,
+            });
+            data.state = ScanState::WaitingForHolderDetection;
+        }
+
+        let mut events = Vec::new();
+        let mut process_start_seconds = Vec::new();
+        core.run_batch_with_emitter(
+            batch_id.clone(),
+            request,
+            Arc::new(AtomicBool::new(false)),
+            &mut |event| {
+                if event.message.contains("Mock-Prozess gestartet") {
+                    process_start_seconds.push(clock.0.load(Ordering::SeqCst));
+                }
+                events.push(event);
+            },
+        );
+
+        assert_eq!(core.snapshot().state, ScanState::BatchCompleted);
+        assert_eq!(
+            clock.0.load(Ordering::SeqCst),
+            90,
+            "exactly three 30s cooldowns"
+        );
+        assert_eq!(process_start_seconds, vec![0, 30, 60, 90]);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.state == ScanState::InterFrameCooldown)
+                .count(),
+            90
+        );
+        assert_eq!(events.last().unwrap().state, ScanState::BatchCompleted);
+
+        let batch: crate::archive::BatchManifest = serde_json::from_slice(
+            &std::fs::read(root.join("batches/batch-four-frame-regression.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(batch.status, BatchArchiveStatus::Completed);
+        assert_eq!(batch.completed_frames, vec![1, 2, 3, 4]);
+
+        let mut captures = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+            .filter_map(|entry| {
+                let manifest = entry.path().join("manifest.json");
+                std::fs::read(manifest).ok().and_then(|bytes| {
+                    serde_json::from_slice::<crate::archive::CaptureManifest>(&bytes).ok()
+                })
+            })
+            .collect::<Vec<_>>();
+        captures.sort_by_key(|capture| capture.frame);
+        assert_eq!(captures.len(), 4);
+        assert_eq!(
+            captures
+                .iter()
+                .map(|capture| capture.frame)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        assert!(captures
+            .iter()
+            .all(|capture| capture.status == ArchiveStatus::Completed));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
