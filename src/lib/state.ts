@@ -17,8 +17,7 @@ export function applyScanEvent(snapshot: AppSnapshot, event: ScanEvent): AppSnap
   return {
     ...snapshot,
     scannerStatus: terminal || waitingForConfirmation ? "ready" : "busy",
-    holderStatus: event.state === "waitingForHolder" ? "unknown" :
-      event.progress >= 24 ? "detected" : snapshot.holderStatus,
+    holderStatus: event.holderStatus ?? snapshot.holderStatus,
     activeJobId: terminal ? null : event.jobId,
     state: event.state,
     progress: event.progress,

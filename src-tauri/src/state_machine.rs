@@ -142,6 +142,27 @@ mod tests {
     }
 
     #[test]
+    fn accepts_single_scan_cleanup_before_completion() {
+        let mut sm = ScanStateMachine::default();
+        for state in [
+            Initializing,
+            OpeningScanner,
+            WaitingForHolder,
+            PositioningFrame,
+            ConfiguringFrame,
+            StartingScan,
+            Scanning,
+            Transferring,
+            Finalizing,
+            ClosingScanner,
+            Completed,
+        ] {
+            sm.transition(state).unwrap();
+        }
+        assert_eq!(sm.state(), Completed);
+    }
+
+    #[test]
     fn accepts_confirmed_batch_and_cooldown_cycle() {
         let mut sm = ScanStateMachine::default();
         for state in [

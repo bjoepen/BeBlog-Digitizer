@@ -2,14 +2,24 @@ import { describe, expect, it } from "vitest";
 import { applyScanEvent, initialSnapshot } from "./state";
 
 describe("applyScanEvent", () => {
-  it("marks the scanner busy during transfer", () => {
+  it("does not infer holder detection from progress", () => {
     const next = applyScanEvent(initialSnapshot, {
       jobId: "job-1", state: "transferring", progress: 52,
       message: "Datenübertragung", level: "info", timestampMs: 1
     });
     expect(next.scannerStatus).toBe("busy");
-    expect(next.holderStatus).toBe("detected");
+    expect(next.holderStatus).toBe("unknown");
     expect(next.activeJobId).toBe("job-1");
+  });
+
+  it("projects explicit typed holder feedback", () => {
+    const next = applyScanEvent(initialSnapshot, {
+      jobId: "job-1", state: "waitingForHolder", progress: 20,
+      message: "Mock holder detected", level: "info", timestampMs: 1, holderStatus: "detected"
+    });
+    expect(next.holderStatus).toBe("detected");
+    const reset = applyScanEvent(next, { jobId: "job-2", state: "initializing", progress: 80, message: "reset", level: "info", timestampMs: 2, holderStatus: "unknown" });
+    expect(reset.holderStatus).toBe("unknown");
   });
 
   it("releases the scanner after cancellation", () => {

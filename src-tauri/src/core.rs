@@ -2,8 +2,8 @@ use crate::{
     adapter::{AdapterStep, FakeScannerAdapter, ScannerAdapter},
     archive::{ArchiveManager, ArchiveStatus, BatchArchiveStatus, PendingCapture},
     model::{
-        AppSnapshot, BatchSnapshot, EventLevel, ScanError, ScanEvent, ScanState, SimulationMode,
-        StartBatchRequest, StartScanRequest,
+        AppSnapshot, BatchSnapshot, EventLevel, HolderStatus, ScanError, ScanEvent, ScanState,
+        SimulationMode, StartBatchRequest, StartScanRequest,
     },
     state_machine::ScanStateMachine,
 };
@@ -239,6 +239,7 @@ impl AppCore {
         });
         data.state = ScanState::AwaitingHolderConfirmation;
         data.progress = 0;
+        data.holder_detected = false;
         let event = batch_event(
             &data,
             ScanState::AwaitingHolderConfirmation,
@@ -286,35 +287,26 @@ impl AppCore {
             batch.cancelled.store(true, Ordering::SeqCst);
             let before = !batch.confirmed;
             let id = batch.id.clone();
-            if before {
-                data.batch = None;
-                data.state = ScanState::BatchCancelled;
-                data.progress = 0;
-            } else {
-                data.state = ScanState::Cancelling;
-            }
+            data.state = ScanState::Cancelling;
             (id, before)
         };
-        emit(
-            app,
-            ScanEvent::new(
-                id.clone(),
-                if before_confirmation {
-                    ScanState::BatchCancelled
-                } else {
-                    ScanState::Cancelling
-                },
-                self.current_progress(),
-                "Batch-Abbruch angefordert",
-                EventLevel::Warning,
-            ),
-        );
         if before_confirmation {
-            let _ = self.archive.update_batch(
+            self.end_batch(
+                app,
                 &id,
-                None,
-                Some(BatchArchiveStatus::Cancelled),
-                Some("Cancelled before holder confirmation".into()),
+                ScanState::BatchCancelled,
+                "Batch vor Filmhalterbestätigung abgebrochen".into(),
+            );
+        } else {
+            emit(
+                app,
+                ScanEvent::new(
+                    id,
+                    ScanState::Cancelling,
+                    self.current_progress(),
+                    "Batch-Abbruch angefordert",
+                    EventLevel::Warning,
+                ),
             );
         }
         Ok(())
@@ -410,6 +402,9 @@ impl AppCore {
                     let mut data = self.data.lock().expect("core mutex poisoned");
                     data.state = step.state;
                     data.progress = step.progress;
+                    if let Some(holder_status) = step.holder_status {
+                        data.holder_detected = holder_status == HolderStatus::Detected;
+                    }
                     let event = ScanEvent::new(
                         id.clone(),
                         step.state,
@@ -417,7 +412,8 @@ impl AppCore {
                         format!("Frame {frame}: {}", step.message),
                         step.level,
                     )
-                    .with_batch(batch_snapshot(data.batch.as_ref().unwrap()));
+                    .with_batch(batch_snapshot(data.batch.as_ref().unwrap()))
+                    .with_holder_status(step.holder_status);
                     drop(data);
                     emit(&app, event);
                 });
@@ -573,17 +569,7 @@ impl AppCore {
     }
 
     fn end_batch(&self, app: &AppHandle, id: &str, state: ScanState, message: String) {
-        let status = match state {
-            ScanState::BatchCompleted => BatchArchiveStatus::Completed,
-            ScanState::BatchCancelled => BatchArchiveStatus::Cancelled,
-            _ => BatchArchiveStatus::Failed,
-        };
-        let failure = if status == BatchArchiveStatus::Completed {
-            None
-        } else {
-            Some(message.clone())
-        };
-        let _ = self.archive.update_batch(id, None, Some(status), failure);
+        let (state, message) = self.persist_batch_terminal(id, state, message);
         let event = {
             let mut data = self.data.lock().expect("core mutex poisoned");
             data.state = state;
@@ -596,10 +582,10 @@ impl AppCore {
                     state,
                     data.progress,
                     message,
-                    if state == ScanState::BatchCompleted {
-                        EventLevel::Info
-                    } else {
-                        EventLevel::Error
+                    match state {
+                        ScanState::BatchCompleted => EventLevel::Info,
+                        ScanState::BatchCancelled => EventLevel::Warning,
+                        _ => EventLevel::Error,
                     },
                 )
                 .with_batch(batch_snapshot(b))
@@ -609,6 +595,38 @@ impl AppCore {
         };
         if let Some(event) = event {
             emit(app, event);
+        }
+    }
+
+    fn persist_batch_terminal(
+        &self,
+        id: &str,
+        state: ScanState,
+        message: String,
+    ) -> (ScanState, String) {
+        let status = match state {
+            ScanState::BatchCompleted => BatchArchiveStatus::Completed,
+            ScanState::BatchCancelled => BatchArchiveStatus::Cancelled,
+            _ => BatchArchiveStatus::Failed,
+        };
+        let failure = if status == BatchArchiveStatus::Completed {
+            None
+        } else {
+            Some(message.clone())
+        };
+        match self.archive.update_batch(id, None, Some(status), failure) {
+            Ok(()) => (state, message),
+            Err(error) => {
+                let detail = format!("{message}; Batchjournal konnte nicht als {status:?} gespeichert werden: {error}");
+                let fallback = self.archive.update_batch(
+                    id,
+                    None,
+                    Some(BatchArchiveStatus::Failed),
+                    Some(detail.clone()),
+                );
+                let suffix = match fallback { Ok(()) => "; Journal als fehlgeschlagen markiert".to_string(), Err(fallback_error) => format!("; auch Fehlerstatus konnte nicht persistiert werden: {fallback_error}; Journal bleibt für Recovery offen") };
+                (ScanState::BatchFailed, format!("{detail}{suffix}"))
+            }
         }
     }
 
@@ -772,8 +790,8 @@ impl AppCore {
             let mut data = self.data.lock().expect("core mutex poisoned");
             data.state = step.state;
             data.progress = step.progress;
-            if step.state == ScanState::ConfiguringFrame {
-                data.holder_detected = true;
+            if let Some(holder_status) = step.holder_status {
+                data.holder_detected = holder_status == HolderStatus::Detected;
             }
             if let Some(job) = data.jobs.iter_mut().find(|job| job.id == id) {
                 job.state = step.state;
@@ -787,7 +805,8 @@ impl AppCore {
                 step.progress,
                 step.message,
                 step.level,
-            ),
+            )
+            .with_holder_status(step.holder_status),
         );
     }
 
@@ -857,6 +876,11 @@ impl ScanEvent {
         self.batch = Some(batch);
         self
     }
+
+    fn with_holder_status(mut self, status: Option<HolderStatus>) -> Self {
+        self.holder_status = status;
+        self
+    }
 }
 
 impl ScanEvent {
@@ -875,6 +899,7 @@ impl ScanEvent {
             level,
             timestamp_ms: now_ms(),
             batch: None,
+            holder_status: None,
         }
     }
 }
@@ -977,5 +1002,68 @@ mod tests {
             clock.wait_second(&AtomicBool::new(false));
         }
         assert_eq!(clock.0.load(Ordering::SeqCst), 30);
+    }
+
+    #[test]
+    fn completed_batch_is_not_reported_when_terminal_journal_write_fails() {
+        let root = std::env::temp_dir().join(format!("beblog-journal-fault-{}", now_ms()));
+        let core = AppCore::new(root.clone());
+        core.archive
+            .begin_batch("batch-journal", &[1, 2, 3, 4])
+            .unwrap();
+        std::fs::write(root.join("batches/batch-journal.json"), b"corrupt journal").unwrap();
+        let (state, message) = core.persist_batch_terminal(
+            "batch-journal",
+            ScanState::BatchCompleted,
+            "simulated completion".into(),
+        );
+        assert_eq!(state, ScanState::BatchFailed);
+        assert!(message.contains("Batchjournal konnte nicht als Completed gespeichert werden"));
+        assert!(message.contains("Journal bleibt für Recovery offen"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn terminal_journal_success_is_required_for_batch_completion() {
+        let root = std::env::temp_dir().join(format!("beblog-journal-ok-{}", now_ms()));
+        let core = AppCore::new(root.clone());
+        core.archive
+            .begin_batch("batch-journal", &[1, 2, 3, 4])
+            .unwrap();
+        let (state, _) = core.persist_batch_terminal(
+            "batch-journal",
+            ScanState::BatchCompleted,
+            "simulated completion".into(),
+        );
+        assert_eq!(state, ScanState::BatchCompleted);
+        let manifest: crate::archive::BatchManifest = serde_json::from_slice(
+            &std::fs::read(root.join("batches/batch-journal.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest.status, BatchArchiveStatus::Completed);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_and_cancelled_batches_surface_journal_write_errors() {
+        for terminal in [ScanState::BatchFailed, ScanState::BatchCancelled] {
+            let root = std::env::temp_dir().join(format!(
+                "beblog-journal-state-{}-{}",
+                now_ms(),
+                terminal as u8
+            ));
+            let core = AppCore::new(root.clone());
+            core.archive.begin_batch("batch-journal", &[1, 2]).unwrap();
+            std::fs::write(root.join("batches/batch-journal.json"), b"corrupt journal").unwrap();
+            let (state, message) = core.persist_batch_terminal(
+                "batch-journal",
+                terminal,
+                "requested terminal outcome".into(),
+            );
+            assert_eq!(state, ScanState::BatchFailed);
+            assert!(message.contains("Batchjournal konnte nicht als"));
+            assert!(message.contains("Journal bleibt für Recovery offen"));
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 }

@@ -6,6 +6,7 @@ export type ScanState =
   | "scanning" | "closingScanner" | "interFrameCooldown" | "batchCompleted" | "batchFailed" | "batchCancelled";
 
 export type SimulationMode = "success" | "error" | "timeout" | "incomplete" | "missingOutput" | "invalidOutput";
+export type HolderStatus = "unknown" | "detected";
 
 export interface BatchSnapshot { batchId: string; frames: number[]; currentFrame: number | null; completedFrames: number; totalFrames: number; cooldownRemainingSeconds: number; awaitingHolderConfirmation: boolean; }
 
@@ -17,6 +18,7 @@ export interface ScanEvent {
   level: "info" | "warning" | "error";
   timestampMs: number;
   batch?: BatchSnapshot;
+  holderStatus?: HolderStatus;
 }
 
 export interface AppSnapshot {

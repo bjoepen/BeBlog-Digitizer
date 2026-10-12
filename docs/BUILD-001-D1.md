@@ -4,6 +4,8 @@
 
 Der Rust-Core reserviert eine Batch-ID und die geordnete Frame-Liste (standardmäßig 1–4). Vor der Filmhalterbestätigung läuft kein Adapterjob. Nach der Bestätigung verarbeitet derselbe `AppCore` jeden Frame sequenziell über `FakeScannerAdapter` und `RecordedProcessRunner`, validiert und archiviert jedes Capture separat und hält zwischen erfolgreichen Frames eine 30-Sekunden-Sperre. Nach Frame 4 gibt es keine weitere Pause.
 
+**Umfangsgrenze:** Frames 1–4 sind ausschließlich der festgelegte Simulationsumfang von Build 001-D1. Das reale Backend unterstützt Filmpositionen 1–6; diese Korrektur erweitert weder UI noch Batch-API auf sechs Frames. Eine spätere Sechser-Erweiterung erfordert einen separaten Build und Hardwarefreigabe.
+
 Während Bestätigung, Scan und Pause bleibt der Batch exklusiv reserviert; parallele Starts werden abgewiesen. Abbruch oder Fehler starten keinen Retry. Bereits abgeschlossene Capture-Manifeste und Dateien bleiben erhalten. Bei Anwendungsneustart werden zurückgelassene `inProgress`-Capture-Manifeste als `interrupted` markiert; Batches werden nicht automatisch fortgesetzt.
 
 Die Sperre liegt vollständig im Rust-Core. `BatchClock` ist injizierbar; die Anwendung nutzt eine monotone, abbrechbare Ein-Sekunden-Wartefunktion. Das Frontend zeigt den vom Core gemeldeten Countdown und steuert keine Zeitlogik.

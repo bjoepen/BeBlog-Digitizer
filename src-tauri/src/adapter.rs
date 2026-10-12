@@ -1,7 +1,7 @@
 use crate::{
     archive::{CaptureKind, CaptureProduct},
     log_parser::{ParsedLog, SidecarLogParser},
-    model::{EventLevel, ScanError, ScanState, SimulationMode, StartScanRequest},
+    model::{EventLevel, HolderStatus, ScanError, ScanState, SimulationMode, StartScanRequest},
     process::{ProcessEvent, ProcessOutcome, ProcessRequest, ProcessRunner, RecordedProcessRunner},
 };
 use std::{
@@ -14,6 +14,7 @@ pub struct AdapterStep {
     pub progress: u8,
     pub message: String,
     pub level: EventLevel,
+    pub holder_status: Option<HolderStatus>,
 }
 
 pub trait ScannerAdapter: Send + Sync + 'static {
@@ -71,6 +72,7 @@ impl ScannerAdapter for FakeScannerAdapter {
                     progress: 2,
                     message: format!("Mock-Prozess gestartet: {program}"),
                     level: EventLevel::Info,
+                    holder_status: Some(HolderStatus::Unknown),
                 }),
                 ProcessEvent::Stdout(line) => match parser.parse(&line) {
                     ParsedLog::Initialized => step(
@@ -86,7 +88,14 @@ impl ScannerAdapter for FakeScannerAdapter {
                         "Scanneröffnung bestätigt",
                     ),
                     ParsedLog::HolderDetected => {
-                        step(emit, ScanState::WaitingForHolder, 20, "Filmhalter erkannt");
+                        let mut holder_step = make_step(
+                            ScanState::WaitingForHolder,
+                            20,
+                            "Filmhalter erkannt",
+                            EventLevel::Info,
+                        );
+                        holder_step.holder_status = Some(HolderStatus::Detected);
+                        emit(holder_step);
                     }
                     ParsedLog::FrameConfigured => step(
                         emit,
@@ -111,6 +120,7 @@ impl ScannerAdapter for FakeScannerAdapter {
                             progress,
                             message: format!("Datenstrom: {bytes} / 1438200 Byte"),
                             level: EventLevel::Info,
+                            holder_status: None,
                         });
                     }
                     ParsedLog::Eof => {
@@ -132,6 +142,7 @@ impl ScannerAdapter for FakeScannerAdapter {
                         progress: if saw_eof { 92 } else { 16 },
                         message: format!("Unbekannte Logmeldung ignoriert: {message}"),
                         level: EventLevel::Warning,
+                        holder_status: None,
                     }),
                 },
                 ProcessEvent::Stderr(message) => emit(AdapterStep {
@@ -139,6 +150,7 @@ impl ScannerAdapter for FakeScannerAdapter {
                     progress: 45,
                     message: format!("Mock-Prozess stderr: {message}"),
                     level: EventLevel::Error,
+                    holder_status: None,
                 }),
                 ProcessEvent::Exited { .. } | ProcessEvent::Cancelled | ProcessEvent::TimedOut => {}
                 ProcessEvent::CleanedUp => step(
@@ -176,12 +188,17 @@ impl ScannerAdapter for FakeScannerAdapter {
 }
 
 fn step(emit: &mut dyn FnMut(AdapterStep), state: ScanState, progress: u8, message: &str) {
-    emit(AdapterStep {
+    emit(make_step(state, progress, message, EventLevel::Info));
+}
+
+fn make_step(state: ScanState, progress: u8, message: &str, level: EventLevel) -> AdapterStep {
+    AdapterStep {
         state,
         progress,
         message: message.into(),
-        level: EventLevel::Info,
-    });
+        level,
+        holder_status: None,
+    }
 }
 
 fn current_state_for_unknown(eof: bool) -> ScanState {
@@ -218,6 +235,12 @@ mod tests {
             .iter()
             .any(|step| step.message.contains("EOF bestätigt")));
         assert_eq!(steps.last().unwrap().state, ScanState::ClosingScanner);
+        assert!(steps
+            .iter()
+            .any(|step| step.holder_status == Some(HolderStatus::Unknown)));
+        assert!(steps
+            .iter()
+            .any(|step| step.holder_status == Some(HolderStatus::Detected)));
         let fixture = include_str!("../tests/fixtures/research-009-success.fixture");
         assert!(fixture.contains("capture ended: total=1438200"));
         assert!(fixture.contains("sane_start (only call)"));

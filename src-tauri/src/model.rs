@@ -27,6 +27,13 @@ pub enum ScanState {
     TimedOut,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum HolderStatus {
+    Unknown,
+    Detected,
+}
+
 #[cfg(test)]
 impl ScanState {
     pub fn terminal(self) -> bool {
@@ -98,6 +105,8 @@ pub struct ScanEvent {
     pub timestamp_ms: u128,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub batch: Option<BatchSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub holder_status: Option<HolderStatus>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
