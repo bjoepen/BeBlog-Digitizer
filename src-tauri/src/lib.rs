@@ -1,6 +1,8 @@
 mod adapter;
 pub mod archive;
 mod core;
+#[cfg(test)]
+mod hardware_test_prep;
 mod log_parser;
 mod model;
 pub mod offline_import;

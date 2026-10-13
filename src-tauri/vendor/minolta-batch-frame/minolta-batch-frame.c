@@ -265,19 +265,40 @@ int main(int argc, char **argv) {
         switch (ch) {
             case 'd': device = optarg; break;
             case 'o': prefix = optarg; break;
-            case 'f': frame = (unsigned)strtoul(optarg, NULL, 10); break;
+            case 'f':
+                if (!minolta_parse_bounded_uint(optarg, 1U, 4U, &frame)) {
+                    fprintf(stderr, "Invalid frame '%s'; allowed values are 1 through 4\n", optarg);
+                    return 2;
+                }
+                break;
             case 'r':
                 if (!minolta_parse_supported_dpi(optarg, &resolution_dpi)) {
                     fprintf(stderr, "Unsupported DPI '%s'; allowed values are 600 and 2820\n", optarg);
                     return 2;
                 }
                 break;
-            case 't': timeout = (unsigned)strtoul(optarg, NULL, 10); break;
-            case 'i': interval = (unsigned)strtoul(optarg, NULL, 10); break;
+            case 't':
+                if (!minolta_parse_bounded_uint(optarg, 1U, 3600U, &timeout)) {
+                    fprintf(stderr, "Invalid holder-detection timeout '%s'; allowed range is 1..%u seconds\n",
+                            optarg, 3600U);
+                    return 2;
+                }
+                break;
+            case 'i':
+                if (!minolta_parse_bounded_uint(optarg, 1U, 60U, &interval)) {
+                    fprintf(stderr, "Invalid polling interval '%s'; allowed range is 1..%u seconds\n",
+                            optarg, 60U);
+                    return 2;
+                }
+                break;
             default: usage(argv[0]); return ch == 'h' ? 0 : 2;
         }
     }
-    if (!device || frame < 1 || frame > 4 || timeout == 0 || interval == 0 || interval > timeout) { usage(argv[0]); return 2; }
+    if (!minolta_validate_cli_tail(device, prefix, timeout, interval, optind, argc)) {
+        fprintf(stderr, "Invalid or incomplete arguments; -t applies only to film-holder polling\n");
+        usage(argv[0]);
+        return 2;
+    }
 
     char log_path[1024], raw_path[1024], meta_path[1024], tiff_path[1024];
     if (snprintf(log_path, sizeof log_path, "%s.client.log", prefix) >= (int)sizeof log_path ||
