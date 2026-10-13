@@ -33,6 +33,8 @@ describe("guided hardware event projection", () => {
     state = projectHardwareEvent(state, { kind: "tiffWritten" });
     state = projectHardwareEvent(state, { kind: "scannerClosing" });
     state = projectHardwareEvent(state, { kind: "complete" });
+    expect(state.state).toBe("closingScanner");
+    state = projectHardwareEvent(state, { kind: "artifactsExported", directory: "/tmp/export", captureId: "capture-1" });
     expect(state.state).toBe("completed");
 
     const inconsistent = projectHardwareEvent(state, { kind: "dataChunk", chunkBytes: 1, totalBytes: 4 });

@@ -1,6 +1,7 @@
 use crate::{
     adapter::{AdapterStep, FakeScannerAdapter, ScannerAdapter},
     archive::{ArchiveManager, ArchiveStatus, BatchArchiveStatus, PendingCapture},
+    guided_process::{GuidedProcessController, GuidedScanRequest},
     model::{
         AppSnapshot, BatchSnapshot, EventLevel, HolderStatus, ScanError, ScanEvent, ScanState,
         SimulationMode, StartBatchRequest, StartScanRequest,
@@ -77,6 +78,8 @@ pub struct AppCore {
     adapter: Arc<dyn ScannerAdapter>,
     archive: ArchiveManager,
     clock: Arc<dyn BatchClock>,
+    guided: GuidedProcessController,
+    resource_dir: std::path::PathBuf,
 }
 
 pub trait BatchClock: Send + Sync + 'static {
@@ -106,11 +109,28 @@ impl AppCore {
     }
 
     pub fn new_with_clock(archive_root: std::path::PathBuf, clock: Arc<dyn BatchClock>) -> Self {
+        Self::new_with_clock_and_resource(archive_root, clock, std::path::PathBuf::new())
+    }
+
+    pub fn new_with_resource(
+        archive_root: std::path::PathBuf,
+        resource_dir: std::path::PathBuf,
+    ) -> Self {
+        Self::new_with_clock_and_resource(archive_root, Arc::new(SystemBatchClock), resource_dir)
+    }
+
+    fn new_with_clock_and_resource(
+        archive_root: std::path::PathBuf,
+        clock: Arc<dyn BatchClock>,
+        resource_dir: std::path::PathBuf,
+    ) -> Self {
         Self {
             data: Arc::new(Mutex::new(CoreData::default())),
             adapter: Arc::new(FakeScannerAdapter::default()),
             archive: ArchiveManager::new(archive_root),
             clock,
+            guided: GuidedProcessController::default(),
+            resource_dir,
         }
     }
 
@@ -121,7 +141,93 @@ impl AppCore {
             adapter: Arc::new(FakeScannerAdapter::with_recorded_fault(fault)),
             archive: ArchiveManager::new(archive_root),
             clock: Arc::new(SystemBatchClock),
+            guided: GuidedProcessController::default(),
+            resource_dir: std::path::PathBuf::new(),
         }
+    }
+
+    pub fn start_guided_scan(
+        &self,
+        app: AppHandle,
+        request: GuidedScanRequest,
+    ) -> Result<String, String> {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut data = self.data.lock().map_err(|_| "Interner Zustandsfehler")?;
+        ensure_idle(&data)?;
+        let on_finished =
+            guided_completion_callback(self.data.clone(), app.clone(), cancelled.clone());
+        let run_id = self.guided.start(
+            app,
+            self.resource_dir.clone(),
+            self.archive.root_path().join(".client-work"),
+            self.archive.clone(),
+            request,
+            cancelled.clone(),
+            on_finished,
+        )?;
+        data.active = Some(ActiveJob {
+            id: format!("guided-{run_id}"),
+            cancelled,
+        });
+        data.state = ScanState::OpeningScanner;
+        data.progress = 0;
+        data.holder_detected = false;
+        Ok(run_id)
+    }
+
+    pub fn start_guided_simulation(
+        &self,
+        app: AppHandle,
+        frame: u8,
+        dpi: u16,
+        output_directory: std::path::PathBuf,
+    ) -> Result<String, String> {
+        let request = GuidedScanRequest {
+            frame,
+            dpi,
+            device: "simulator:hardware-free".into(),
+            confirmed_device: "simulator:hardware-free".into(),
+            output_directory,
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut data = self.data.lock().map_err(|_| "Interner Zustandsfehler")?;
+        ensure_idle(&data)?;
+        let on_finished =
+            guided_completion_callback(self.data.clone(), app.clone(), cancelled.clone());
+        let run_id = self.guided.start_simulation(
+            app,
+            self.archive.root_path().join(".client-work"),
+            self.archive.clone(),
+            request,
+            cancelled.clone(),
+            on_finished,
+        )?;
+        data.active = Some(ActiveJob {
+            id: format!("guided-{run_id}"),
+            cancelled,
+        });
+        data.state = ScanState::OpeningScanner;
+        data.progress = 0;
+        data.holder_detected = false;
+        Ok(run_id)
+    }
+
+    pub fn confirm_guided_holder(&self) -> Result<(), String> {
+        self.guided.confirm_holder()
+    }
+
+    pub fn cancel_guided_scan(&self) -> Result<(), String> {
+        self.guided.cancel()?;
+        let mut data = self.data.lock().map_err(|_| "Interner Zustandsfehler")?;
+        if let Some(job) = data
+            .active
+            .as_ref()
+            .filter(|job| job.id.starts_with("guided-"))
+        {
+            job.cancelled.store(true, Ordering::SeqCst);
+            data.state = ScanState::Cancelling;
+        }
+        Ok(())
     }
 
     pub fn recover_archive(&self) -> Result<Vec<String>, String> {
@@ -1012,6 +1118,55 @@ impl ScanEvent {
     fn with_holder_status(mut self, status: Option<HolderStatus>) -> Self {
         self.holder_status = status;
         self
+    }
+}
+
+fn guided_completion_callback(
+    data_ref: Arc<Mutex<CoreData>>,
+    app: AppHandle,
+    cancelled: Arc<AtomicBool>,
+) -> impl FnOnce(bool) + Send + 'static {
+    move |succeeded| {
+        let state = if succeeded {
+            ScanState::Completed
+        } else if cancelled.load(Ordering::SeqCst) {
+            ScanState::Cancelled
+        } else {
+            ScanState::Failed
+        };
+        if let Ok(mut data) = data_ref.lock() {
+            if data
+                .active
+                .as_ref()
+                .is_some_and(|job| job.id.starts_with("guided-"))
+            {
+                data.active = None;
+                data.state = state;
+                if succeeded {
+                    data.progress = 100;
+                }
+            }
+        }
+        emit(
+            &app,
+            ScanEvent::new(
+                "guided-client".into(),
+                state,
+                if succeeded { 100 } else { 0 },
+                if succeeded {
+                    "Scan geprüft und exportiert"
+                } else if state == ScanState::Cancelled {
+                    "Scan abgebrochen"
+                } else {
+                    "Scan fehlgeschlagen"
+                },
+                if succeeded {
+                    EventLevel::Info
+                } else {
+                    EventLevel::Warning
+                },
+            ),
+        );
     }
 }
 

@@ -1,13 +1,15 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/svelte";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/svelte";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => () => {}) }));
+const eventState = vi.hoisted(() => ({ handler: undefined as undefined | ((event: { payload: unknown }) => void) }));
+vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async (_name: string, handler: (event: { payload: unknown }) => void) => { eventState.handler = handler; return () => {}; }) }));
+vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(async () => "guided-test-run") }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn(async () => null) }));
 
 import App from "./App.svelte";
 
 describe("App", () => {
-  afterEach(() => cleanup());
+  afterEach(() => { cleanup(); eventState.handler = undefined; });
 
   it("shows single-frame controls but keeps real scanner start locked pending hash approval", () => {
     render(App);
@@ -26,6 +28,18 @@ describe("App", () => {
     expect(screen.getByText(/erst nach einem echten Clientereignis/)).toBeInTheDocument();
   });
 
+  it("shows the holder prompt only after the actual typed OPENED event", async () => {
+    const dialog = await import("@tauri-apps/plugin-dialog");
+    vi.mocked(dialog.open).mockResolvedValueOnce("/Volumes/Scan SSD/Film");
+    render(App);
+    await fireEvent.click(screen.getByRole("button", { name: "Ordner auswählen …" }));
+    await fireEvent.click(screen.getByRole("button", { name: "Geführten Ablauf simulieren" }));
+    await waitFor(() => expect(eventState.handler).toBeDefined());
+    eventState.handler!({ payload: { kind: "opened" } });
+    expect(await screen.findByText(/Filmhalter jetzt einsetzen/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Filmhalter eingesetzt bestätigen" })).toBeInTheDocument();
+  });
+
   it("allows choosing an external archive folder without starting a scan", async () => {
     const dialog = await import("@tauri-apps/plugin-dialog");
     vi.mocked(dialog.open).mockResolvedValueOnce("/Volumes/Scan SSD/Film");
@@ -33,5 +47,16 @@ describe("App", () => {
     await fireEvent.click(screen.getByRole("button", { name: "Ordner auswählen …" }));
     expect(screen.getByLabelText("Ausgabeordner")).toHaveValue("/Volumes/Scan SSD/Film");
     expect(screen.getByRole("button", { name: "Einzelbildscan starten" })).toBeDisabled();
+  });
+
+  it("starts only the explicitly labelled hardware-free guided simulation from the app UI", async () => {
+    const dialog = await import("@tauri-apps/plugin-dialog");
+    vi.mocked(dialog.open).mockResolvedValueOnce("/Volumes/Scan SSD/Film");
+    const tauri = await import("@tauri-apps/api/core");
+    render(App);
+    await fireEvent.click(screen.getByRole("button", { name: "Ordner auswählen …" }));
+    await fireEvent.click(screen.getByRole("button", { name: "Geführten Ablauf simulieren" }));
+    await waitFor(() => expect(tauri.invoke).toHaveBeenCalledWith("start_guided_simulation", { frame: 1, dpi: 2820, outputDirectory: "/Volumes/Scan SSD/Film" }));
+    expect(screen.getByText(/Der D4-Clienthash ist noch nicht unabhängig freigegeben/)).toBeInTheDocument();
   });
 });

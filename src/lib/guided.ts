@@ -10,9 +10,17 @@ export type HardwareClientEvent =
   | { kind: "tiffWritten" }
   | { kind: "scannerClosing" }
   | { kind: "complete" }
-  | { kind: "error"; detail: string };
+  | { kind: "error"; detail: string }
+  | { kind: "diagnostic"; stream: string; message: string }
+  | { kind: "artifactsExported"; directory: string; captureId: string }
+  | { kind: "processFailed"; detail: string }
+  | { kind: "processExited"; exitCode: number }
+  | { kind: "processCleaned" }
+  | { kind: "processCancelled" }
+  | { kind: "processTimedOut" }
+  | { kind: "processForcedKill" };
 
-export type GuidedState = "idle" | "openingScanner" | "awaitingHolderConfirmation" | "waitingForHolderDetection" | "positioningFrame" | "configuringFrame" | "scanning" | "transferring" | "finalizing" | "closingScanner" | "completed" | "failed";
+export type GuidedState = "idle" | "openingScanner" | "awaitingHolderConfirmation" | "waitingForHolderDetection" | "positioningFrame" | "configuringFrame" | "scanning" | "transferring" | "finalizing" | "closingScanner" | "completed" | "cancelled" | "timedOut" | "failed";
 
 export interface GuidedProjection {
   state: GuidedState;
@@ -35,6 +43,21 @@ export function projectHardwareEvent(current: GuidedProjection, event: HardwareC
     case "openFailed":
     case "error":
       return { ...current, state: "failed", error: event.detail };
+    case "processFailed":
+      return current.state === "cancelled" || current.state === "timedOut"
+        ? current
+        : { ...current, state: "failed", error: event.detail };
+    case "diagnostic":
+    case "processExited":
+    case "processCleaned":
+    case "processForcedKill":
+      return current;
+    case "processCancelled":
+      return { ...current, state: "cancelled", error: null };
+    case "processTimedOut":
+      return { ...current, state: "timedOut", error: "Gesamt-Timeout überschritten" };
+    case "artifactsExported":
+      return { ...current, state: "completed" };
     case "holderDetected":
       return current.state === "waitingForHolderDetection" ? { ...current, holderDetected: true, state: "positioningFrame" } : current;
     case "framePositioned":
@@ -53,7 +76,9 @@ export function projectHardwareEvent(current: GuidedProjection, event: HardwareC
     case "scannerClosing":
       return current.state === "finalizing" && current.tiffWritten ? { ...current, state: "closingScanner" } : current;
     case "complete":
-      return current.state === "closingScanner" ? { ...current, state: "completed" } : current;
+      // Client text is not the final application success condition; only the
+      // validated archive/export event can transition the visible UI to done.
+      return current;
   }
 }
 

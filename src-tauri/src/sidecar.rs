@@ -1,7 +1,7 @@
-//! Resolve and verify the fixed ARM64 test sidecar resource.
+//! Resolve and verify fixed ARM64 sidecar resources.
 //!
-//! This module intentionally provides no process-start API. Only the harmless
-//! test sidecar is packaged in D3-B4; production process execution remains gated.
+//! Minolta client resolution remains denied until an independent SHA-256
+//! approval is set in source. The harmless app-self simulator is separate.
 
 use sha2::{Digest, Sha256};
 use std::{
@@ -24,6 +24,37 @@ pub(crate) fn trusted_arm64_test_sidecar() -> TrustedSha256 {
     TrustedSha256::from_bytes(ARM64_TEST_SIDECAR_SHA256)
 }
 
+/// The D4 client candidate has deliberately not received independent approval.
+/// Until a value is reviewed and committed here, the real scanner path is closed.
+pub(crate) fn resolve_approved_minolta_client(resource_dir: &Path) -> io::Result<ResolvedSidecar> {
+    // Current D4 candidate binary hash is documented in the D4 audit only. It
+    // must never be copied into this trust anchor automatically; the value
+    // remains None until separate approval.
+    const APPROVED_MINOLTA_CLIENT_SHA256: Option<&str> = None;
+    let value = APPROVED_MINOLTA_CLIENT_SHA256.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Minolta-Client ist gesperrt: unabhängige SHA-256-Freigabe steht aus",
+        )
+    })?;
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Freigegebener Minolta-Clienthash ist ungültig",
+        ));
+    }
+    let mut digest = [0_u8; 32];
+    for (index, byte) in digest.iter_mut().enumerate() {
+        *byte =
+            u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).map_err(io::Error::other)?;
+    }
+    SidecarResolver::resolve(
+        resource_dir,
+        SidecarResource::MinoltaClient,
+        TrustedSha256::from_bytes(digest),
+    )
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct TrustedSha256([u8; 32]);
 
@@ -34,14 +65,17 @@ impl TrustedSha256 {
 }
 
 #[derive(Clone, Copy, Debug)]
+#[allow(dead_code)] // Minolta resource remains unavailable until its trust hash is approved.
 pub(crate) enum SidecarResource {
     Arm64Test,
+    MinoltaClient,
 }
 
 impl SidecarResource {
     fn relative_path(self) -> PathBuf {
         match self {
             Self::Arm64Test => PathBuf::from("sidecars/macos-aarch64/beblog-test-sidecar"),
+            Self::MinoltaClient => PathBuf::from("sidecars/macos-aarch64/minolta-batch-frame"),
         }
     }
 }
@@ -54,7 +88,6 @@ pub(crate) struct ResolvedSidecar {
 }
 
 impl ResolvedSidecar {
-    #[cfg(test)]
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
@@ -511,5 +544,16 @@ mod tests {
         let resolved = SidecarResolver::resolve_test_harness().unwrap();
         assert_eq!(resolved.path(), std::env::current_exe().unwrap());
         assert_ne!(resolved.sha256(), [0; 32]);
+    }
+
+    #[test]
+    fn minolta_client_resource_remains_unlaunchable_without_independent_hash_approval() {
+        let root =
+            std::env::temp_dir().join(format!("beblog-minolta-gate-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let error = resolve_approved_minolta_client(&root).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("SHA-256-Freigabe steht aus"));
+        fs::remove_dir_all(root).unwrap();
     }
 }
