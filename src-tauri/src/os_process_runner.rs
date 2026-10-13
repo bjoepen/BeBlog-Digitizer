@@ -4,7 +4,7 @@
 //! fixed here. There is no public path, shell, or arbitrary argument surface.
 
 use super::{ProcessEvent, ProcessOutcome, ProcessRequest, ProcessRunner};
-use crate::log_parser::LogStream;
+use crate::{log_parser::LogStream, sidecar::SidecarResolver};
 use std::{
     io::{Read, Write},
     process::{Child, Command, ExitStatus, Stdio},
@@ -160,8 +160,8 @@ impl ProcessRunner for OsProcessRunner {
             }
             path
         } else {
-            match std::env::current_exe() {
-                Ok(path) => path,
+            match SidecarResolver::resolve_test_harness() {
+                Ok(resolved) => resolved.path().to_path_buf(),
                 Err(error) => {
                     let message = format!("sicheres Testprogramm nicht verfügbar: {error}");
                     emit(ProcessEvent::StartFailed(message.clone()));

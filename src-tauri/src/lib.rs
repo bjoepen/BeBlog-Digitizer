@@ -5,6 +5,8 @@ mod log_parser;
 mod model;
 pub mod offline_import;
 mod process;
+#[allow(dead_code)] // Intentionally dormant; no production command consumes a resolved sidecar.
+mod sidecar;
 mod state_machine;
 
 use core::{AppCore, JobSummary};

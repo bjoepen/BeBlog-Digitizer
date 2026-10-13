@@ -31,6 +31,19 @@ pub struct OfflineArtifactPaths {
     pub client_log: PathBuf,
 }
 
+impl OfflineArtifactPaths {
+    /// Fixed output names for a future runner-owned, exclusive capture directory.
+    /// The client log is never consulted to construct any of these paths.
+    pub fn from_fixed_output_directory(directory: &Path) -> Self {
+        Self {
+            raw: directory.join("capture.raw"),
+            tiff: directory.join("capture.tiff"),
+            params_txt: directory.join("capture.params.txt"),
+            client_log: directory.join("capture.client.log"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum StagingStatus {
@@ -1047,6 +1060,21 @@ mod tests {
             fs::write(path, bytes).unwrap();
         }
         paths
+    }
+
+    #[test]
+    fn fixed_output_layout_uses_only_expected_artifact_names() {
+        let paths = OfflineArtifactPaths::from_fixed_output_directory(Path::new("/reserved/job"));
+        assert_eq!(paths.raw, Path::new("/reserved/job/capture.raw"));
+        assert_eq!(paths.tiff, Path::new("/reserved/job/capture.tiff"));
+        assert_eq!(
+            paths.params_txt,
+            Path::new("/reserved/job/capture.params.txt")
+        );
+        assert_eq!(
+            paths.client_log,
+            Path::new("/reserved/job/capture.client.log")
+        );
     }
 
     #[test]
