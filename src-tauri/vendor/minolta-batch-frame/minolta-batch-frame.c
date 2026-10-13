@@ -48,6 +48,32 @@ static void diag(const char *fmt, ...) {
     fflush(stderr);
 }
 
+/* Stable, machine-readable control channel. Diagnostics stay on stderr. */
+static void protocol_event(const char *name, const char *fields) {
+    printf("BEBLOG/1\t%s", name);
+    if (fields && *fields) printf("\t%s", fields);
+    putchar('\n');
+    fflush(stdout);
+}
+
+static bool wait_for_app_continue(void) {
+    char line[32];
+    protocol_event("OPENED", "");
+    for (;;) {
+        errno = 0;
+        if (!fgets(line, sizeof line, stdin)) {
+            if (interrupted) return false;
+            if (errno == EINTR) { clearerr(stdin); continue; }
+            return false;
+        }
+        line[strcspn(line, "\r\n")] = '\0';
+        if (strcmp(line, "CONTINUE") == 0) return true;
+        if (strcmp(line, "CANCEL") == 0) return false;
+        protocol_event("PROTOCOL_ERROR", "expected-CONTINUE-or-CANCEL");
+        return false;
+    }
+}
+
 static void log_status(const char *call, SANE_Status st) {
     diag("%s -> %d (%s)\n", call, (int)st, sane_strstatus(st));
 }
@@ -322,9 +348,20 @@ int main(int argc, char **argv) {
 
     SANE_Handle h = NULL;
     bool scan_active = false;
+    bool open_failed = false;
     st = sane_open(device, &h);
     log_status("sane_open (only call)", st);
-    if (st != SANE_STATUS_GOOD) goto done;
+    if (st != SANE_STATUS_GOOD) {
+        open_failed = true;
+        protocol_event("OPEN_FAILED", "sane_open");
+        goto done;
+    }
+    /* Hard synchronization barrier: holder polling cannot start until the UI
+       has received OPENED and sent CONTINUE after its explicit user action. */
+    if (!wait_for_app_continue()) {
+        st = SANE_STATUS_CANCELLED;
+        goto done;
+    }
 
     int frame_opt = find_option(h, "frame");
     int mode_opt = find_option(h, SANE_NAME_SCAN_MODE);
@@ -337,10 +374,16 @@ int main(int argc, char **argv) {
     st = wait_for_holder(h, frame_opt, timeout, interval);
     log_status("wait_for_holder", st);
     if (st != SANE_STATUS_GOOD) goto done;
+    protocol_event("HOLDER_DETECTED", "");
 
     if ((st = set_word(h, frame_opt, (SANE_Word)frame, "frame")) != SANE_STATUS_GOOD ||
         (st = set_string(h, mode_opt, SANE_VALUE_SCAN_MODE_COLOR, "mode")) != SANE_STATUS_GOOD ||
         (st = set_word(h, resolution_opt, (SANE_Word)resolution_dpi, "resolution")) != SANE_STATUS_GOOD) goto done;
+    {
+        char fields[128];
+        snprintf(fields, sizeof fields, "%u", frame);
+        protocol_event("FRAME_POSITIONED", fields);
+    }
 
     SANE_Word selected_resolution = 0;
     if ((st = get_word(h, resolution_opt, &selected_resolution, "resolution")) != SANE_STATUS_GOOD)
@@ -372,10 +415,20 @@ int main(int argc, char **argv) {
          frame_name(params.format), params.last_frame, params.bytes_per_line,
          params.pixels_per_line, params.lines, params.depth);
 
+    {
+        char fields[192];
+        snprintf(fields, sizeof fields, "%u\t%d\t%d\t%d\t%d\tRGB\t%llu",
+                 resolution_dpi, params.pixels_per_line, params.lines,
+                 params.bytes_per_line, params.depth,
+                 (unsigned long long)geometry.raw_bytes);
+        protocol_event("PARAMETERS", fields);
+    }
+
     st = sane_start(h);
     log_status("sane_start (only call)", st);
     if (st != SANE_STATUS_GOOD) goto done;
     scan_active = true;
+    protocol_event("SCAN_STARTED", "");
 
     st = sane_get_parameters(h, &params);
     log_status("sane_get_parameters(after start)", st);
@@ -416,6 +469,9 @@ int main(int argc, char **argv) {
             }
             if (fwrite(buf, 1, (size_t)got, raw) != (size_t)got) { terminal = SANE_STATUS_IO_ERROR; break; }
             total += (uint64_t)got;
+            char fields[96];
+            snprintf(fields, sizeof fields, "%d\t%llu", (int)got, (unsigned long long)total);
+            protocol_event("DATA_CHUNK", fields);
         }
         if (terminal == SANE_STATUS_EOF) break;
         if (terminal != SANE_STATUS_GOOD) break;
@@ -428,6 +484,11 @@ int main(int argc, char **argv) {
              (unsigned long long)total, (unsigned long long)geometry.raw_bytes);
         terminal = SANE_STATUS_IO_ERROR;
     }
+    if (terminal == SANE_STATUS_EOF) {
+        char fields[32];
+        snprintf(fields, sizeof fields, "%llu", (unsigned long long)total);
+        protocol_event("EOF", fields);
+    }
     diag("capture ended: total=%llu terminal=%d (%s)\n",
          (unsigned long long)total, (int)terminal, sane_strstatus(terminal));
     bool metadata_ok = write_metadata(meta_path, device, &params, resolution_dpi,
@@ -437,11 +498,18 @@ int main(int argc, char **argv) {
         scan_active = false;
         bool tiff_ok = raw_to_tiff(raw_path, tiff_path, &params);
         st = metadata_ok && tiff_ok ? SANE_STATUS_GOOD : SANE_STATUS_IO_ERROR;
+        if (st == SANE_STATUS_GOOD) protocol_event("TIFF_WRITTEN", "");
     } else {
         st = terminal;
     }
 
 done:
+    if (st != SANE_STATUS_GOOD && !open_failed) {
+        char fields[64];
+        snprintf(fields, sizeof fields, "status=%d", (int)st);
+        protocol_event("ERROR", fields);
+    }
+    protocol_event("SCANNER_CLOSING", "");
     if (h && scan_active) {
         diag("abnormal active-scan termination: sane_cancel\n");
         sane_cancel(h);
@@ -451,5 +519,6 @@ done:
     diag("sane_exit\n"); sane_exit();
     diag("client exit -> %d (%s)\n", (int)st, sane_strstatus(st));
     fclose(log_file);
+    if (st == SANE_STATUS_GOOD) protocol_event("COMPLETE", "");
     return st == SANE_STATUS_GOOD ? 0 : 1;
 }

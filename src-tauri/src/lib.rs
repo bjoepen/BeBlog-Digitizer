@@ -1,6 +1,7 @@
 mod adapter;
 pub mod archive;
 mod core;
+mod guided_protocol;
 #[cfg(test)]
 mod hardware_test_prep;
 mod log_parser;
@@ -60,6 +61,7 @@ fn cancel_batch(app: AppHandle, core: State<'_, AppCore>) -> Result<(), String> 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let resource_dir = app.path().resource_dir()?;
             sidecar::SidecarResolver::resolve(

@@ -1,1 +1,1 @@
-{"main-window":{"identifier":"main-window","description":"Only the local main window may call the typed application core.","local":true,"windows":["main"],"permissions":["core:default"]}}
+{"main-window":{"identifier":"main-window","description":"Only the local main window may call the typed application core.","local":true,"windows":["main"],"permissions":["core:default","dialog:allow-open"]}}
