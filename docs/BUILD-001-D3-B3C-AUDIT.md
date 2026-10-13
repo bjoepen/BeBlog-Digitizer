@@ -79,3 +79,9 @@ The Production guard was not changed. Even a future valid process proof is insuf
 ## D3-B3c verification
 
 `cargo test --manifest-path src-tauri/Cargo.toml` PASS (88 passed, 12 intentionally ignored test-harness child entry points); `cargo fmt --manifest-path src-tauri/Cargo.toml --check` PASS; `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings` PASS; `pnpm check` PASS; `pnpm test` PASS (7/7); `pnpm build` PASS; `pnpm tauri build --bundles app` PASS (native macOS `.app`); `git diff --check` PASS.
+
+## D3-B3c.1 correction
+
+The private evidence constructor now requires both the runner's complete OS observation and the final `ProcessOutcome`. It produces evidence only when that final outcome is explicitly `Exited(0)`, in addition to the existing successful wait/reap, stdout/stderr EOF, joined readers, cleanup, no-timeout, no-cancellation, no-forced-kill, and no-unresolved-error conditions. Regression coverage keeps the observation otherwise fully successful while supplying `Exited(7)` and `UnexpectedEnd`; neither can produce evidence. This does not alter the process runner's event policy or any production/archive gate.
+
+D3-B3c.1 verification: `cargo test --manifest-path src-tauri/Cargo.toml` PASS (88 passed, 12 ignored); `cargo fmt --manifest-path src-tauri/Cargo.toml --check` PASS; `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings` PASS; `pnpm check` PASS; `pnpm test` PASS (7/7); `pnpm build` PASS; `pnpm tauri build --bundles app` PASS (native macOS `.app`); `git diff --check` PASS. All execution was hardware-free; no scanner, SANE, Homebrew, or Research artifacts were accessed.

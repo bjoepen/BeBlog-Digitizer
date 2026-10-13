@@ -49,8 +49,12 @@ struct RunnerObservation {
 }
 
 impl ProcessEvidence {
-    fn from_runner_observation(observation: RunnerObservation) -> Option<Self> {
-        if observation.pid == 0
+    fn from_runner_observation(
+        observation: RunnerObservation,
+        final_outcome: &ProcessOutcome,
+    ) -> Option<Self> {
+        if !matches!(final_outcome, ProcessOutcome::Exited(0))
+            || observation.pid == 0
             || observation.executable_sha256.is_none()
             || observation.waited_exit_code != Some(0)
             || !observation.stdout_eof
@@ -516,21 +520,24 @@ impl OsProcessRunner {
             emit(ProcessEvent::CleanupFailed(message.clone()));
             ProcessOutcome::CleanupFailed(message)
         };
-        let evidence = ProcessEvidence::from_runner_observation(RunnerObservation {
-            run_id,
-            pid,
-            executable_sha256,
-            waited_exit_code,
-            stdout_eof: streams.stdout_eof,
-            stderr_eof: streams.stderr_eof,
-            readers_joined,
-            reaped,
-            cleanup_complete,
-            timed_out: timed_out_observed,
-            cancelled: cancelled_observed,
-            forced_kill,
-            unresolved_error: reader_error_observed || cleanup_error_observed,
-        });
+        let evidence = ProcessEvidence::from_runner_observation(
+            RunnerObservation {
+                run_id,
+                pid,
+                executable_sha256,
+                waited_exit_code,
+                stdout_eof: streams.stdout_eof,
+                stderr_eof: streams.stderr_eof,
+                readers_joined,
+                reaped,
+                cleanup_complete,
+                timed_out: timed_out_observed,
+                cancelled: cancelled_observed,
+                forced_kill,
+                unresolved_error: reader_error_observed || cleanup_error_observed,
+            },
+            &outcome,
+        );
         (outcome, evidence)
     }
 }
@@ -932,22 +939,54 @@ mod tests {
         };
         let mut incomplete = full_observation();
         incomplete.stdout_eof = false;
-        assert!(ProcessEvidence::from_runner_observation(incomplete).is_none());
+        assert!(
+            ProcessEvidence::from_runner_observation(incomplete, &ProcessOutcome::Exited(0))
+                .is_none()
+        );
         let mut cleanup_failure = full_observation();
         cleanup_failure.cleanup_complete = false;
-        assert!(ProcessEvidence::from_runner_observation(cleanup_failure).is_none());
+        assert!(ProcessEvidence::from_runner_observation(
+            cleanup_failure,
+            &ProcessOutcome::Exited(0)
+        )
+        .is_none());
         let mut forced = full_observation();
         forced.forced_kill = true;
-        assert!(ProcessEvidence::from_runner_observation(forced).is_none());
+        assert!(
+            ProcessEvidence::from_runner_observation(forced, &ProcessOutcome::Exited(0)).is_none()
+        );
         let mut reader_failure = full_observation();
         reader_failure.unresolved_error = true;
-        assert!(ProcessEvidence::from_runner_observation(reader_failure).is_none());
+        assert!(ProcessEvidence::from_runner_observation(
+            reader_failure,
+            &ProcessOutcome::Exited(0)
+        )
+        .is_none());
         let mut no_reap = full_observation();
         no_reap.reaped = false;
-        assert!(ProcessEvidence::from_runner_observation(no_reap).is_none());
+        assert!(
+            ProcessEvidence::from_runner_observation(no_reap, &ProcessOutcome::Exited(0)).is_none()
+        );
         let mut reader_not_joined = full_observation();
         reader_not_joined.readers_joined = false;
-        assert!(ProcessEvidence::from_runner_observation(reader_not_joined).is_none());
+        assert!(ProcessEvidence::from_runner_observation(
+            reader_not_joined,
+            &ProcessOutcome::Exited(0)
+        )
+        .is_none());
+
+        // Even a complete OS observation is insufficient if the final outcome
+        // returned by the runner is not exactly Exited(0).
+        assert!(ProcessEvidence::from_runner_observation(
+            full_observation(),
+            &ProcessOutcome::Exited(7),
+        )
+        .is_none());
+        assert!(ProcessEvidence::from_runner_observation(
+            full_observation(),
+            &ProcessOutcome::UnexpectedEnd("late reader error".into()),
+        )
+        .is_none());
     }
 
     #[test]
