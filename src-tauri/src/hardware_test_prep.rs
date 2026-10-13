@@ -211,6 +211,23 @@ mod tests {
             &root.join("runs")
         )
         .is_err());
+
+        // Synthetic thin x86_64 Mach-O header: architecture rejection only;
+        // this test file is never executed or linked as a client.
+        let wrong_arch = root.join("x86-test-client");
+        let x86_header = [0xcf, 0xfa, 0xed, 0xfe, 0x07, 0, 0, 1, 1, 2, 3, 4];
+        fs::write(&wrong_arch, x86_header).unwrap();
+        fs::set_permissions(&wrong_arch, fs::Permissions::from_mode(0o700)).unwrap();
+        let wrong_hash = format!("{:x}", Sha256::digest(x86_header));
+        assert!(prepare_hardware_test(
+            &wrong_arch,
+            &wrong_hash,
+            "device",
+            "device",
+            &root.join("runs")
+        )
+        .is_err());
+
         assert!(!root.join("runs").exists());
         fs::remove_dir_all(root).unwrap();
     }

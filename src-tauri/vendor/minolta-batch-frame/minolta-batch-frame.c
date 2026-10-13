@@ -250,7 +250,7 @@ static bool raw_to_tiff(const char *raw_path, const char *tiff_path, const SANE_
 
 static void usage(const char *argv0) {
     fprintf(stderr, "Usage: %s -d DEVICE [-o PREFIX] [-f FRAME] [-r DPI (600|2820)] [-t SECONDS] [-i SECONDS]\n"
-                    "Example: %s -d 'avision:libusb:002:006' -o frame1 -r 2820\n",
+                    "Example: %s -d '<explicitly-confirmed-device>' -o frame1 -r 2820\n",
             argv0, argv0);
 }
 
