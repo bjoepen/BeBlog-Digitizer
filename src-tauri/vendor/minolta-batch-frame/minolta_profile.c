@@ -6,18 +6,39 @@
 #define MINOLTA_MAX_RAW_BYTES (512ULL * 1024ULL * 1024ULL)
 #define TIFF_CLASSIC_MAX_BYTES (0xffffffffULL - 4096ULL)
 
-bool minolta_parse_supported_dpi(const char *text, unsigned *dpi) {
-    if (!text || !*text || !dpi) return false;
+bool minolta_parse_bounded_uint(const char *text, unsigned minimum, unsigned maximum,
+                                unsigned *value) {
+    if (!text || !*text || !value || minimum > maximum) return false;
     for (const char *cursor = text; *cursor; ++cursor) {
         if (*cursor < '0' || *cursor > '9') return false;
     }
     errno = 0;
     char *end = NULL;
-    unsigned long value = strtoul(text, &end, 10);
-    if (errno != 0 || end == text || *end != '\0' || value > UINT32_MAX) return false;
-    if (value != 600UL && value != 2820UL) return false;
-    *dpi = (unsigned)value;
+    unsigned long parsed = strtoul(text, &end, 10);
+    if (errno == ERANGE || end == text || *end != '\0' || parsed < minimum ||
+        parsed > maximum || parsed > UINT32_MAX) return false;
+    *value = (unsigned)parsed;
     return true;
+}
+
+bool minolta_parse_supported_dpi(const char *text, unsigned *dpi) {
+    if (!dpi) return false;
+    return minolta_parse_bounded_uint(text, 600U, 2820U, dpi) &&
+           (*dpi == 600U || *dpi == 2820U);
+}
+
+bool minolta_validate_holder_polling(unsigned timeout_seconds, unsigned interval_seconds) {
+    return timeout_seconds >= 1U && timeout_seconds <= 3600U &&
+           interval_seconds >= 1U && interval_seconds <= 60U &&
+           interval_seconds <= timeout_seconds;
+}
+
+bool minolta_validate_cli_tail(const char *device, const char *prefix,
+                               unsigned timeout_seconds, unsigned interval_seconds,
+                               int first_unparsed_argument, int argument_count) {
+    return device && *device && prefix && *prefix &&
+           minolta_validate_holder_polling(timeout_seconds, interval_seconds) &&
+           first_unparsed_argument == argument_count;
 }
 
 bool minolta_validate_rgb8_geometry(unsigned dpi, bool is_rgb, unsigned depth,
