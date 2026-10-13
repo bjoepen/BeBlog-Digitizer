@@ -22,6 +22,62 @@ const READER_QUEUE_CAPACITY: usize = 32;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const TERMINATION_GRACE: Duration = Duration::from_millis(250);
 
+/// Ephemeral proof, private to this test-only OS runner module. It cannot be
+/// serialized, cloned, supplied by an adapter, or consumed by ArchiveManager.
+#[derive(Debug)]
+struct ProcessEvidence {
+    run_id: uuid::Uuid,
+    pid: u32,
+    executable_sha256: [u8; 32],
+    exit_code: i32,
+}
+
+struct RunnerObservation {
+    run_id: uuid::Uuid,
+    pid: u32,
+    executable_sha256: Option<[u8; 32]>,
+    waited_exit_code: Option<i32>,
+    stdout_eof: bool,
+    stderr_eof: bool,
+    readers_joined: bool,
+    reaped: bool,
+    cleanup_complete: bool,
+    timed_out: bool,
+    cancelled: bool,
+    forced_kill: bool,
+    unresolved_error: bool,
+}
+
+impl ProcessEvidence {
+    fn from_runner_observation(
+        observation: RunnerObservation,
+        final_outcome: &ProcessOutcome,
+    ) -> Option<Self> {
+        if !matches!(final_outcome, ProcessOutcome::Exited(0))
+            || observation.pid == 0
+            || observation.executable_sha256.is_none()
+            || observation.waited_exit_code != Some(0)
+            || !observation.stdout_eof
+            || !observation.stderr_eof
+            || !observation.readers_joined
+            || !observation.reaped
+            || !observation.cleanup_complete
+            || observation.timed_out
+            || observation.cancelled
+            || observation.forced_kill
+            || observation.unresolved_error
+        {
+            return None;
+        }
+        Some(Self {
+            run_id: observation.run_id,
+            pid: observation.pid,
+            executable_sha256: observation.executable_sha256?,
+            exit_code: 0,
+        })
+    }
+}
+
 static PROCESS_EXCLUSIVE: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug)]
@@ -110,6 +166,8 @@ enum ReaderMessage {
 struct StreamState {
     stdout_closed: bool,
     stderr_closed: bool,
+    stdout_eof: bool,
+    stderr_eof: bool,
 }
 
 impl StreamState {
@@ -123,6 +181,13 @@ impl StreamState {
     fn all_closed(&self) -> bool {
         self.stdout_closed && self.stderr_closed
     }
+
+    fn eof_mut(&mut self, stream: LogStream) -> &mut bool {
+        match stream {
+            LogStream::Stdout => &mut self.stdout_eof,
+            LogStream::Stderr => &mut self.stderr_eof,
+        }
+    }
 }
 
 impl ProcessRunner for OsProcessRunner {
@@ -132,9 +197,21 @@ impl ProcessRunner for OsProcessRunner {
         cancelled: Arc<AtomicBool>,
         emit: &mut dyn FnMut(ProcessEvent),
     ) -> ProcessOutcome {
+        self.run_with_evidence(request, cancelled, emit).0
+    }
+}
+
+impl OsProcessRunner {
+    fn run_with_evidence(
+        &self,
+        request: &ProcessRequest,
+        cancelled: Arc<AtomicBool>,
+        emit: &mut dyn FnMut(ProcessEvent),
+    ) -> (ProcessOutcome, Option<ProcessEvidence>) {
+        let run_id = uuid::Uuid::new_v4();
         if cancelled.load(Ordering::SeqCst) {
             emit(ProcessEvent::Cancelled);
-            return ProcessOutcome::Cancelled;
+            return (ProcessOutcome::Cancelled, None);
         }
 
         // Blocking acquisition serializes runs. It is held until wait/reap and both
@@ -146,29 +223,32 @@ impl ProcessRunner for OsProcessRunner {
         };
         if cancelled.load(Ordering::SeqCst) {
             emit(ProcessEvent::Cancelled);
-            return ProcessOutcome::Cancelled;
+            return (ProcessOutcome::Cancelled, None);
         }
 
-        let executable = if matches!(self.program, SafeTestProgram::SpawnFailure) {
-            // This reserved path is used only to exercise OS spawn failure. Never
-            // start it if the sentinel unexpectedly exists.
-            let path = std::path::PathBuf::from("/__beblog_digitizer_d3_b2_missing_test_program__");
-            if path.exists() {
-                let message = "reservierter Spawnfehler-Testpfad existiert unerwartet".to_string();
-                emit(ProcessEvent::StartFailed(message.clone()));
-                return ProcessOutcome::StartFailed(message);
-            }
-            path
-        } else {
-            match SidecarResolver::resolve_test_harness() {
-                Ok(resolved) => resolved.path().to_path_buf(),
-                Err(error) => {
-                    let message = format!("sicheres Testprogramm nicht verfügbar: {error}");
+        let (executable, executable_sha256) =
+            if matches!(self.program, SafeTestProgram::SpawnFailure) {
+                // This reserved path is used only to exercise OS spawn failure. Never
+                // start it if the sentinel unexpectedly exists.
+                let path =
+                    std::path::PathBuf::from("/__beblog_digitizer_d3_b2_missing_test_program__");
+                if path.exists() {
+                    let message =
+                        "reservierter Spawnfehler-Testpfad existiert unerwartet".to_string();
                     emit(ProcessEvent::StartFailed(message.clone()));
-                    return ProcessOutcome::StartFailed(message);
+                    return (ProcessOutcome::StartFailed(message), None);
                 }
-            }
-        };
+                (path, None)
+            } else {
+                match SidecarResolver::resolve_test_harness() {
+                    Ok(resolved) => (resolved.path().to_path_buf(), Some(resolved.sha256())),
+                    Err(error) => {
+                        let message = format!("sicheres Testprogramm nicht verfügbar: {error}");
+                        emit(ProcessEvent::StartFailed(message.clone()));
+                        return (ProcessOutcome::StartFailed(message), None);
+                    }
+                }
+            };
         let mut command = Command::new(executable);
         command
             .stdin(Stdio::null())
@@ -194,7 +274,7 @@ impl ProcessRunner for OsProcessRunner {
             Err(error) => {
                 let message = format!("sicheres Testprogramm konnte nicht starten: {error}");
                 emit(ProcessEvent::StartFailed(message.clone()));
-                return ProcessOutcome::StartFailed(message);
+                return (ProcessOutcome::StartFailed(message), None);
             }
         };
         let pid = child.id();
@@ -213,10 +293,14 @@ impl ProcessRunner for OsProcessRunner {
             None => Err("stderr pipe was not created".to_string()),
         };
         let mut reader_threads = Vec::new();
+        let mut readers_expected = 0;
         let mut cleanup_errors = Vec::new();
         for thread in [stdout_thread, stderr_thread] {
             match thread {
-                Ok(handle) => reader_threads.push(handle),
+                Ok(handle) => {
+                    readers_expected += 1;
+                    reader_threads.push(handle);
+                }
                 Err(error) => cleanup_errors.push(error),
             }
         }
@@ -292,6 +376,7 @@ impl ProcessRunner for OsProcessRunner {
                     let closed = streams.closed_mut(stream);
                     if !*closed {
                         *closed = true;
+                        *streams.eof_mut(stream) = true;
                         emit(match stream {
                             LogStream::Stdout => ProcessEvent::StdoutClosed,
                             LogStream::Stderr => ProcessEvent::StderrClosed,
@@ -361,8 +446,12 @@ impl ProcessRunner for OsProcessRunner {
                 None
             }
         };
+        let waited_exit_code = waited_status.as_ref().and_then(ExitStatus::code);
+        let reaped = waited_status.is_some();
+        let mut readers_joined = readers_expected == 2;
         for handle in reader_threads {
             if handle.join().is_err() {
+                readers_joined = false;
                 cleanup_errors.push("Stream-Reader-Thread ist abgestürzt".into());
             }
         }
@@ -374,6 +463,7 @@ impl ProcessRunner for OsProcessRunner {
         if !streams.stderr_closed {
             emit(ProcessEvent::StderrClosed);
         }
+        let reader_error_observed = reader_failure.is_some();
 
         // On Unix (including macOS), Rust documents that try_wait returning
         // Some(status) has already reaped the PID. Keep that OS-level proof for
@@ -397,6 +487,8 @@ impl ProcessRunner for OsProcessRunner {
         } else {
             ProcessOutcome::UnexpectedEnd("kein Prozessabschlussstatus beobachtet".into())
         };
+        let timed_out_observed = matches!(&outcome, ProcessOutcome::TimedOut);
+        let cancelled_observed = matches!(&outcome, ProcessOutcome::Cancelled);
 
         if forced_kill
             && !matches!(
@@ -418,14 +510,35 @@ impl ProcessRunner for OsProcessRunner {
             ProcessOutcome::StartFailed(_) | ProcessOutcome::CleanupFailed(_) => {}
         }
 
-        if cleanup_errors.is_empty() {
+        let cleanup_complete = cleanup_errors.is_empty();
+        let cleanup_error_observed = !cleanup_complete;
+        let outcome = if cleanup_complete {
             emit(ProcessEvent::CleanedUp);
             outcome
         } else {
             let message = cleanup_errors.join("; ");
             emit(ProcessEvent::CleanupFailed(message.clone()));
             ProcessOutcome::CleanupFailed(message)
-        }
+        };
+        let evidence = ProcessEvidence::from_runner_observation(
+            RunnerObservation {
+                run_id,
+                pid,
+                executable_sha256,
+                waited_exit_code,
+                stdout_eof: streams.stdout_eof,
+                stderr_eof: streams.stderr_eof,
+                readers_joined,
+                reaped,
+                cleanup_complete,
+                timed_out: timed_out_observed,
+                cancelled: cancelled_observed,
+                forced_kill,
+                unresolved_error: reader_error_observed || cleanup_error_observed,
+            },
+            &outcome,
+        );
+        (outcome, evidence)
     }
 }
 
@@ -726,6 +839,192 @@ mod tests {
         (outcome, events)
     }
 
+    fn run_with_evidence(
+        program: SafeTestProgram,
+        timeout: Duration,
+        cancel: Arc<AtomicBool>,
+    ) -> (ProcessOutcome, Option<ProcessEvidence>, Vec<ProcessEvent>) {
+        let request = ProcessRequest {
+            frame: 1,
+            simulation: crate::model::SimulationMode::Success,
+            timeout,
+        };
+        let mut events = Vec::new();
+        let (outcome, evidence) =
+            OsProcessRunner::new(program)
+                .run_with_evidence(&request, cancel, &mut |event| events.push(event));
+        (outcome, evidence, events)
+    }
+
+    #[test]
+    fn only_complete_successful_os_run_produces_ephemeral_evidence() {
+        let (outcome, proof, events) = run_with_evidence(
+            SafeTestProgram::Streams,
+            Duration::from_secs(2),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert_eq!(outcome, ProcessOutcome::Exited(0));
+        let proof = proof.expect("full OS lifecycle should produce evidence");
+        assert_ne!(proof.run_id, uuid::Uuid::nil());
+        assert!(proof.pid > 0);
+        assert_ne!(proof.executable_sha256, [0; 32]);
+        assert_eq!(proof.exit_code, 0);
+        assert!(events.contains(&ProcessEvent::StdoutClosed));
+        assert!(events.contains(&ProcessEvent::StderrClosed));
+        assert!(events.contains(&ProcessEvent::Reaped { code: Some(0) }));
+
+        for program in [SafeTestProgram::Streams, SafeTestProgram::Silent] {
+            let (_, next, _) = run_with_evidence(
+                program,
+                Duration::from_secs(2),
+                Arc::new(AtomicBool::new(false)),
+            );
+            assert_ne!(proof.run_id, next.unwrap().run_id);
+        }
+    }
+
+    #[test]
+    fn failures_and_incomplete_runner_observations_never_produce_evidence() {
+        for (program, timeout, cancel, expected) in [
+            (
+                SafeTestProgram::ExitFailure,
+                Duration::from_secs(2),
+                false,
+                "nonzero exit",
+            ),
+            (
+                SafeTestProgram::SpawnFailure,
+                Duration::from_secs(2),
+                false,
+                "start failure",
+            ),
+            (
+                SafeTestProgram::WaitForTermination,
+                Duration::from_millis(100),
+                false,
+                "timeout",
+            ),
+            (
+                SafeTestProgram::WaitForTermination,
+                Duration::from_secs(2),
+                true,
+                "pre-start cancellation",
+            ),
+        ] {
+            let (outcome, proof, _) =
+                run_with_evidence(program, timeout, Arc::new(AtomicBool::new(cancel)));
+            assert!(proof.is_none(), "{expected} unexpectedly produced proof");
+            match expected {
+                "nonzero exit" => assert_eq!(outcome, ProcessOutcome::Exited(7)),
+                "start failure" => assert!(matches!(outcome, ProcessOutcome::StartFailed(_))),
+                "timeout" => assert_eq!(outcome, ProcessOutcome::TimedOut),
+                _ => assert_eq!(outcome, ProcessOutcome::Cancelled),
+            }
+        }
+
+        let full_observation = || RunnerObservation {
+            run_id: uuid::Uuid::new_v4(),
+            pid: 42,
+            executable_sha256: Some([1; 32]),
+            waited_exit_code: Some(0),
+            stdout_eof: true,
+            stderr_eof: true,
+            readers_joined: true,
+            reaped: true,
+            cleanup_complete: true,
+            timed_out: false,
+            cancelled: false,
+            forced_kill: false,
+            unresolved_error: false,
+        };
+        let mut incomplete = full_observation();
+        incomplete.stdout_eof = false;
+        assert!(
+            ProcessEvidence::from_runner_observation(incomplete, &ProcessOutcome::Exited(0))
+                .is_none()
+        );
+        let mut cleanup_failure = full_observation();
+        cleanup_failure.cleanup_complete = false;
+        assert!(ProcessEvidence::from_runner_observation(
+            cleanup_failure,
+            &ProcessOutcome::Exited(0)
+        )
+        .is_none());
+        let mut forced = full_observation();
+        forced.forced_kill = true;
+        assert!(
+            ProcessEvidence::from_runner_observation(forced, &ProcessOutcome::Exited(0)).is_none()
+        );
+        let mut reader_failure = full_observation();
+        reader_failure.unresolved_error = true;
+        assert!(ProcessEvidence::from_runner_observation(
+            reader_failure,
+            &ProcessOutcome::Exited(0)
+        )
+        .is_none());
+        let mut no_reap = full_observation();
+        no_reap.reaped = false;
+        assert!(
+            ProcessEvidence::from_runner_observation(no_reap, &ProcessOutcome::Exited(0)).is_none()
+        );
+        let mut reader_not_joined = full_observation();
+        reader_not_joined.readers_joined = false;
+        assert!(ProcessEvidence::from_runner_observation(
+            reader_not_joined,
+            &ProcessOutcome::Exited(0)
+        )
+        .is_none());
+
+        // Even a complete OS observation is insufficient if the final outcome
+        // returned by the runner is not exactly Exited(0).
+        assert!(ProcessEvidence::from_runner_observation(
+            full_observation(),
+            &ProcessOutcome::Exited(7),
+        )
+        .is_none());
+        assert!(ProcessEvidence::from_runner_observation(
+            full_observation(),
+            &ProcessOutcome::UnexpectedEnd("late reader error".into()),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn cancellation_during_a_running_process_never_produces_evidence() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let child_ready = Arc::new(AtomicBool::new(false));
+        let cancel_for_runner = cancel.clone();
+        let ready_for_runner = child_ready.clone();
+        let handle = thread::spawn(move || {
+            let request = ProcessRequest {
+                frame: 1,
+                simulation: crate::model::SimulationMode::Success,
+                timeout: Duration::from_secs(5),
+            };
+            let mut events = Vec::new();
+            let (outcome, evidence) = OsProcessRunner::new(SafeTestProgram::WaitForTermination)
+                .run_with_evidence(&request, cancel_for_runner, &mut |event| {
+                    if matches!(&event, ProcessEvent::Stdout(line) if line == "READY") {
+                        ready_for_runner.store(true, Ordering::SeqCst);
+                    }
+                    events.push(event);
+                });
+            (outcome, evidence)
+        });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !child_ready.load(Ordering::SeqCst) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            child_ready.load(Ordering::SeqCst),
+            "test child did not start"
+        );
+        cancel.store(true, Ordering::SeqCst);
+        let (outcome, evidence) = handle.join().unwrap();
+        assert_eq!(outcome, ProcessOutcome::Cancelled);
+        assert!(evidence.is_none());
+    }
+
     #[test]
     fn captures_both_streams_pid_exit_and_closure_before_cleanup() {
         let (outcome, events) = run(
@@ -939,12 +1238,13 @@ mod tests {
 
     #[test]
     fn timeout_and_ignored_signal_force_kill_then_reap() {
-        let (outcome, events) = run(
+        let (outcome, evidence, events) = run_with_evidence(
             SafeTestProgram::IgnoreTermination,
             Duration::from_millis(100),
             Arc::new(AtomicBool::new(false)),
         );
         assert_eq!(outcome, ProcessOutcome::TimedOut);
+        assert!(evidence.is_none());
         assert!(events.contains(&ProcessEvent::ForcedKill));
         assert_eq!(events.last(), Some(&ProcessEvent::CleanedUp));
         let pid = events
@@ -963,12 +1263,13 @@ mod tests {
     #[test]
     fn timeout_escalates_after_streams_close_if_child_keeps_running() {
         let started = Instant::now();
-        let (outcome, events) = run(
+        let (outcome, evidence, events) = run_with_evidence(
             SafeTestProgram::CloseStreamsIgnoreTermination,
             Duration::from_millis(100),
             Arc::new(AtomicBool::new(false)),
         );
         assert_eq!(outcome, ProcessOutcome::TimedOut);
+        assert!(evidence.is_none());
         assert!(started.elapsed() < Duration::from_secs(3), "runner hung");
         assert!(events.contains(&ProcessEvent::StdoutClosed));
         assert!(events.contains(&ProcessEvent::StderrClosed));
