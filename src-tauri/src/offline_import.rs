@@ -15,13 +15,23 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const RAW_BYTES: usize = 1_438_200;
-const WIDTH: u32 = 564;
-const HEIGHT: u32 = 850;
-const BYTES_PER_LINE: u32 = 1_692;
-const MAX_TIFF_BYTES: u64 = 4 * 1024 * 1024;
+const LEGACY_600_RAW_BYTES: u64 = 1_438_200;
+const LEGACY_600_WIDTH: u32 = 564;
+const LEGACY_600_HEIGHT: u32 = 850;
+const LEGACY_600_BYTES_PER_LINE: u32 = 1_692;
+const MAX_RAW_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_TIFF_BYTES: u64 = MAX_RAW_BYTES + 4096;
 const MAX_LOG_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_PARAMS_BYTES: u64 = 64 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ValidatedRgb8Profile {
+    pub resolution_dpi: u16,
+    pub pixels_per_line: u32,
+    pub lines: u32,
+    pub bytes_per_line: u32,
+    pub raw_bytes: u64,
+}
 
 #[derive(Debug, Clone)]
 pub struct OfflineArtifactPaths {
@@ -107,7 +117,7 @@ impl Artifact {
 
     fn max_bytes(self) -> u64 {
         match self {
-            Self::Raw => RAW_BYTES as u64,
+            Self::Raw => MAX_RAW_BYTES,
             Self::Tiff => MAX_TIFF_BYTES,
             Self::Params => MAX_PARAMS_BYTES,
             Self::ClientLog => MAX_LOG_BYTES,
@@ -159,7 +169,7 @@ pub fn import_offline_artifacts(
         }
     };
 
-    let pending = match archive.begin_offline_import(frame) {
+    let pending = match archive.begin_offline_import(frame, product.profile) {
         Ok(pending) => pending,
         Err(error) => {
             stage.status = StagingStatus::Failed;
@@ -340,12 +350,13 @@ fn read_and_validate_stage(frame: u8, directory: &Path) -> io::Result<OfflineCap
         Artifact::ClientLog.name(),
         Artifact::ClientLog.max_bytes(),
     )?;
-    validate_artifact_bytes(frame, &raw, &tiff, &params_txt, &client_log)?;
+    let profile = validate_artifact_profile(frame, &raw, &tiff, &params_txt, &client_log)?;
     Ok(OfflineCaptureProduct {
         raw,
         tiff,
         params_txt,
         client_log,
+        profile,
     })
 }
 
@@ -380,6 +391,7 @@ fn read_staged_file(directory: &Path, name: &str, max_bytes: u64) -> io::Result<
     Ok(bytes)
 }
 
+#[cfg(test)]
 pub(crate) fn validate_artifact_bytes(
     frame: u8,
     raw: &[u8],
@@ -387,23 +399,32 @@ pub(crate) fn validate_artifact_bytes(
     params_txt: &[u8],
     client_log: &[u8],
 ) -> io::Result<()> {
-    if raw.len() != RAW_BYTES {
+    validate_artifact_profile(frame, raw, tiff, params_txt, client_log).map(|_| ())
+}
+
+pub(crate) fn validate_artifact_profile(
+    frame: u8,
+    raw: &[u8],
+    tiff: &[u8],
+    params_txt: &[u8],
+    client_log: &[u8],
+) -> io::Result<ValidatedRgb8Profile> {
+    if raw.is_empty() || raw.len() as u64 > MAX_RAW_BYTES {
         return Err(invalid_data(format!(
-            "RAW-Größe {} statt {} Byte",
-            raw.len(),
-            RAW_BYTES
+            "RAW-Größe {} ist leer oder überschreitet das Profil-Limit",
+            raw.len()
         )));
     }
     let params = parse_params(params_txt)?;
-    validate_profile_metadata(&params, frame)?;
-    let tiff_pixels = validate_tiff_profile(tiff)?;
+    let profile = validate_profile_metadata(&params, frame, raw.len() as u64)?;
+    let tiff_pixels = validate_tiff_profile(tiff, profile)?;
     if tiff.get(tiff_pixels) != Some(raw) {
         return Err(invalid_data(
             "TIFF-Pixelbytes stimmen nicht mit den zugehörigen RAW-Bytes überein",
         ));
     }
-    validate_log_profile(frame, client_log)?;
-    Ok(())
+    validate_log_profile(frame, profile, client_log)?;
+    Ok(profile)
 }
 
 fn parse_params(bytes: &[u8]) -> io::Result<std::collections::BTreeMap<String, String>> {
@@ -429,31 +450,62 @@ fn parse_params(bytes: &[u8]) -> io::Result<std::collections::BTreeMap<String, S
 fn validate_profile_metadata(
     params: &std::collections::BTreeMap<String, String>,
     frame: u8,
-) -> io::Result<()> {
-    for (key, expected) in [
-        ("format", "RGB"),
-        ("bytes_per_line", "1692"),
-        ("pixels_per_line", "564"),
-        ("lines", "850"),
-        ("depth", "8"),
-        ("raw_bytes", "1438200"),
-        ("terminal_status", "5"),
-    ] {
-        if params.get(key).map(String::as_str) != Some(expected) {
-            return Err(invalid_data(format!(
-                "Metadatenprofil stimmt bei {key} nicht mit RGB8/600-dpi-Profil überein"
-            )));
-        }
+    raw_len: u64,
+) -> io::Result<ValidatedRgb8Profile> {
+    if params.get("format").map(String::as_str) != Some("RGB")
+        || params.get("depth").map(String::as_str) != Some("8")
+        || params.get("terminal_status").map(String::as_str) != Some("5")
+    {
+        return Err(invalid_data(
+            "Metadaten bestätigen kein vollständiges RGB8-EOF-Profil",
+        ));
     }
     if params.get("device").is_none_or(String::is_empty) {
         return Err(invalid_data("Metadaten enthalten keinen Gerätebezeichner"));
     }
-    for key in ["resolution", "resolution_dpi", "dpi"] {
-        if params.get(key).is_some_and(|value| value != "600") {
-            return Err(invalid_data(format!(
-                "Metadatenauflösung {key} ist nicht 600 dpi"
-            )));
+
+    let mut declared_dpi = None;
+    for key in [
+        "requested_resolution_dpi",
+        "actual_resolution_dpi",
+        "resolution_dpi",
+        "resolution",
+        "dpi",
+    ] {
+        if let Some(value) = params.get(key) {
+            if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(invalid_data(format!("Ungültige Metadatenauflösung {key}")));
+            }
+            let parsed = value
+                .parse::<u16>()
+                .map_err(|_| invalid_data(format!("Ungültige Metadatenauflösung {key}")))?;
+            if !matches!(parsed, 600 | 2820)
+                || declared_dpi.is_some_and(|previous| previous != parsed)
+            {
+                return Err(invalid_data(
+                    "Metadaten enthalten eine nicht unterstützte oder widersprüchliche DPI-Angabe",
+                ));
+            }
+            declared_dpi = Some(parsed);
         }
+    }
+    let resolution_dpi = declared_dpi.unwrap_or(600);
+    if resolution_dpi == 2820
+        && (params.get("requested_resolution_dpi").map(String::as_str) != Some("2820")
+            || params.get("actual_resolution_dpi").map(String::as_str) != Some("2820"))
+    {
+        return Err(invalid_data(
+            "2820-dpi-Metadaten benötigen übereinstimmende Anforderung und SANE-Readback",
+        ));
+    }
+    if params
+        .get("channels")
+        .is_some_and(|channels| channels != "3")
+        || (resolution_dpi == 2820 && params.get("channels").map(String::as_str) != Some("3"))
+    {
+        return Err(invalid_data(
+            "Metadaten bestätigen nicht genau drei RGB-Kanäle",
+        ));
     }
     if let Some(metadata_frame) = params.get("frame") {
         if metadata_frame.parse::<u8>().ok() != Some(frame) {
@@ -462,16 +514,87 @@ fn validate_profile_metadata(
             ));
         }
     }
-    let line_bytes = 564_u64 * 3 * 8 / 8;
-    if line_bytes != u64::from(BYTES_PER_LINE)
-        || u64::from(BYTES_PER_LINE) * u64::from(HEIGHT) != RAW_BYTES as u64
-    {
-        return Err(invalid_data("Interner RGB8-Profilvertrag ist inkonsistent"));
+
+    let pixels_per_line = parse_positive_dimension(params, "pixels_per_line")?;
+    let lines = parse_positive_dimension(params, "lines")?;
+    let bytes_per_line = parse_positive_dimension(params, "bytes_per_line")?;
+    let expected_stride = pixels_per_line
+        .checked_mul(3)
+        .ok_or_else(|| invalid_data("RGB8-Zeilenbreite läuft über"))?;
+    if bytes_per_line != expected_stride {
+        return Err(invalid_data(
+            "RGB8-Stride muss exakt drei Bytes pro Pixel enthalten",
+        ));
     }
-    Ok(())
+    let expected_raw = u64::from(bytes_per_line)
+        .checked_mul(u64::from(lines))
+        .filter(|bytes| *bytes <= MAX_RAW_BYTES)
+        .ok_or_else(|| invalid_data("RGB8-RAW-Größe läuft über oder überschreitet das Limit"))?;
+    if expected_raw != raw_len
+        || params
+            .get("raw_bytes")
+            .and_then(|value| value.parse::<u64>().ok())
+            != Some(expected_raw)
+    {
+        return Err(invalid_data(
+            "RAW-Dateigröße, Metadaten und RGB8-Geometrie widersprechen sich",
+        ));
+    }
+    match params.get("expected_raw_bytes") {
+        Some(value) if value.parse::<u64>().ok() == Some(expected_raw) => {}
+        Some(_) => {
+            return Err(invalid_data(
+                "Metadaten-Erwartungsgröße widerspricht der RGB8-Geometrie",
+            ));
+        }
+        None if resolution_dpi == 2820 => {
+            return Err(invalid_data(
+                "2820-dpi-Metadaten benötigen expected_raw_bytes",
+            ));
+        }
+        None => {}
+    }
+    if resolution_dpi == 600
+        && (pixels_per_line != LEGACY_600_WIDTH
+            || lines != LEGACY_600_HEIGHT
+            || bytes_per_line != LEGACY_600_BYTES_PER_LINE
+            || expected_raw != LEGACY_600_RAW_BYTES)
+    {
+        return Err(invalid_data(
+            "Das etablierte 600-dpi-Profil darf seine Geometrie nicht ändern",
+        ));
+    }
+    Ok(ValidatedRgb8Profile {
+        resolution_dpi,
+        pixels_per_line,
+        lines,
+        bytes_per_line,
+        raw_bytes: expected_raw,
+    })
 }
 
-fn validate_log_profile(frame: u8, bytes: &[u8]) -> io::Result<()> {
+fn parse_positive_dimension(
+    params: &std::collections::BTreeMap<String, String>,
+    key: &str,
+) -> io::Result<u32> {
+    let text = params
+        .get(key)
+        .ok_or_else(|| invalid_data(format!("Metadatenfeld {key} fehlt")))?;
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(invalid_data(format!(
+            "Metadatenfeld {key} ist keine gültige Dimension"
+        )));
+    }
+    let value = text
+        .parse::<u32>()
+        .map_err(|_| invalid_data(format!("Metadatenfeld {key} ist keine gültige Dimension")))?;
+    if value == 0 {
+        return Err(invalid_data(format!("Metadatenfeld {key} ist null")));
+    }
+    Ok(value)
+}
+
+fn validate_log_profile(frame: u8, profile: ValidatedRgb8Profile, bytes: &[u8]) -> io::Result<()> {
     let text = std::str::from_utf8(bytes).map_err(|_| invalid_data("Clientlog ist kein UTF-8"))?;
     if text.contains('\0') {
         return Err(invalid_data("Clientlog enthält NUL-Bytes"));
@@ -509,7 +632,10 @@ fn validate_log_profile(frame: u8, bytes: &[u8]) -> io::Result<()> {
             "Clientdiagnosen verletzen die erwartete Startreihenfolge",
         ));
     }
-    let expected_parameters = "format=RGB last=1 bpl=1692 pixels=564 lines=850 depth=8";
+    let expected_parameters = format!(
+        "format=RGB last=1 bpl={} pixels={} lines={} depth=8",
+        profile.bytes_per_line, profile.pixels_per_line, profile.lines
+    );
     let frame_line = format!("sane_control_option(frame, SET={frame}) -> 0");
     let frame_at = normalized
         .iter()
@@ -517,18 +643,32 @@ fn validate_log_profile(frame: u8, bytes: &[u8]) -> io::Result<()> {
     let mode_at = normalized
         .iter()
         .position(|line| line.contains("sane_control_option(mode, SET='Color') -> 0"));
-    let resolution_at = normalized
-        .iter()
-        .position(|line| line.contains("sane_control_option(resolution, SET=600) -> 0"));
+    let resolution_at = normalized.iter().position(|line| {
+        line.contains(&format!(
+            "sane_control_option(resolution, SET={}) -> 0",
+            profile.resolution_dpi
+        ))
+    });
+    let resolution_readback_at = normalized.iter().position(|line| {
+        line.contains(&format!(
+            "sane_control_option(resolution, GET={}) -> 0",
+            profile.resolution_dpi
+        ))
+    });
     let pre_parameters_at = normalized
         .iter()
-        .position(|line| line.contains("parameters(pre): ") && line.contains(expected_parameters));
-    let post_parameters_at = normalized
-        .iter()
-        .position(|line| line.contains("parameters(post): ") && line.contains(expected_parameters));
+        .position(|line| line.contains("parameters(pre): ") && line.contains(&expected_parameters));
+    let post_parameters_at = normalized.iter().position(|line| {
+        line.contains("parameters(post): ") && line.contains(&expected_parameters)
+    });
     if frame_at.is_none_or(|index| index != configured)
         || mode_at.is_none_or(|index| index <= configured || index >= started)
         || resolution_at.is_none_or(|index| index <= configured || index >= started)
+        || (profile.resolution_dpi == 2820 && resolution_readback_at.is_none())
+        || resolution_readback_at.is_some_and(|index| {
+            resolution_at.is_none_or(|set| index <= set)
+                || pre_parameters_at.is_none_or(|pre| index >= pre)
+        })
         || pre_parameters_at.is_none_or(|index| index <= configured || index >= started)
         || post_parameters_at.is_none_or(|index| index <= started)
         || mode_at
@@ -539,10 +679,10 @@ fn validate_log_profile(frame: u8, bytes: &[u8]) -> io::Result<()> {
             .is_none_or(|(resolution, pre)| resolution >= pre)
     {
         return Err(invalid_data(
-            "Clientlog bestätigt Frame/RGB/600-dpi-Profil nicht in der erwarteten Reihenfolge",
+            "Clientlog bestätigt Frame/RGB/DPI-Profil nicht in der erwarteten Reihenfolge",
         ));
     }
-    let mut transfer = TransferAccumulator::new(RAW_BYTES as u64);
+    let mut transfer = TransferAccumulator::new(profile.raw_bytes);
     let mut eof_at = None;
     let mut total_at = None;
     let mut tiff_at = None;
@@ -562,7 +702,7 @@ fn validate_log_profile(frame: u8, bytes: &[u8]) -> io::Result<()> {
                         invalid_data(format!("Finaler EOF-Chunk ungültig: {error:?}"))
                     })?;
                 }
-                if transfer.total() != RAW_BYTES as u64 {
+                if transfer.total() != profile.raw_bytes {
                     return Err(invalid_data("EOF vor vollständiger RAW-Übertragung"));
                 }
                 eof_at = Some(index);
@@ -622,10 +762,15 @@ fn validate_log_profile(frame: u8, bytes: &[u8]) -> io::Result<()> {
         || close_at
             .zip(sane_exit_at)
             .is_none_or(|(close, exit)| close >= exit)
-        || client_total != Some(RAW_BYTES as u64)
+        || client_total != Some(profile.raw_bytes)
     {
         return Err(invalid_data(
             "Clientlog-Finalisierung ist unvollständig oder widersprüchlich",
+        ));
+    }
+    if client_total != Some(profile.raw_bytes) {
+        return Err(invalid_data(
+            "Client-Gesamtbytezahl stimmt nicht mit validierter Geometrie überein",
         ));
     }
     Ok(())
@@ -715,7 +860,10 @@ impl<'a> TiffReader<'a> {
     }
 }
 
-fn validate_tiff_profile(bytes: &[u8]) -> io::Result<std::ops::Range<usize>> {
+fn validate_tiff_profile(
+    bytes: &[u8],
+    profile: ValidatedRgb8Profile,
+) -> io::Result<std::ops::Range<usize>> {
     if bytes.len() < 8 {
         return Err(invalid_data("TIFF-Header unvollständig"));
     }
@@ -822,12 +970,12 @@ fn validate_tiff_profile(bytes: &[u8]) -> io::Result<std::ops::Range<usize>> {
             .and_then(|(_, values)| values.first().copied())
             .ok_or_else(|| invalid_data(format!("TIFF-Pflichttag {tag} fehlt")))
     };
-    if one(256)? != WIDTH
-        || one(257)? != HEIGHT
+    if one(256)? != profile.pixels_per_line
+        || one(257)? != profile.lines
         || one(259)? != 1
         || one(262)? != 2
         || one(277)? != 3
-        || one(278)? != HEIGHT
+        || one(278)? != profile.lines
         || one(284)? != 1
     {
         return Err(invalid_data(
@@ -841,13 +989,15 @@ fn validate_tiff_profile(bytes: &[u8]) -> io::Result<std::ops::Range<usize>> {
     let has_y_resolution = tags.contains_key(&283);
     if has_x_resolution != has_y_resolution
         || (has_x_resolution
-            && (tags.get(&282).map(|(_, values)| values.as_slice()) != Some(&[600, 1, 1][..])
-                || tags.get(&283).map(|(_, values)| values.as_slice()) != Some(&[600, 1, 1][..])
+            && (tags.get(&282).map(|(_, values)| values.as_slice())
+                != Some(&[u32::from(profile.resolution_dpi), 1, 1][..])
+                || tags.get(&283).map(|(_, values)| values.as_slice())
+                    != Some(&[u32::from(profile.resolution_dpi), 1, 1][..])
                 || tags.get(&296).map(|(_, values)| values.as_slice()) != Some(&[2][..])))
         || (!has_x_resolution && tags.contains_key(&296))
     {
         return Err(invalid_data(
-            "TIFF-Auflösung muss, falls enthalten, konsistent 600 dpi sein",
+            "TIFF-Auflösung muss, falls enthalten, konsistent zur angeforderten DPI sein",
         ));
     }
     if let Some((_, orientation)) = tags.get(&274) {
@@ -898,8 +1048,8 @@ fn validate_tiff_profile(bytes: &[u8]) -> io::Result<std::ops::Range<usize>> {
             .checked_add(u64::from(count))
             .ok_or_else(|| invalid_data("TIFF-Stripbytezahl überläuft"))?;
     }
-    if total != RAW_BYTES as u64
-        || image_ranges.iter().map(|range| range.len()).sum::<usize>() != RAW_BYTES
+    if total != profile.raw_bytes
+        || image_ranges.iter().map(|range| range.len()).sum::<usize>() as u64 != profile.raw_bytes
     {
         return Err(invalid_data(
             "TIFF-Strips enthalten nicht genau das RGB8-RAW-Profil",
@@ -949,12 +1099,40 @@ mod tests {
     use super::*;
     use crate::archive::{ArchiveStatus, CaptureKind};
 
+    const RAW_BYTES: usize = LEGACY_600_RAW_BYTES as usize;
+    const WIDTH: u32 = LEGACY_600_WIDTH;
+    const HEIGHT: u32 = LEGACY_600_HEIGHT;
+
+    fn legacy_600_profile() -> ValidatedRgb8Profile {
+        ValidatedRgb8Profile {
+            resolution_dpi: 600,
+            pixels_per_line: LEGACY_600_WIDTH,
+            lines: LEGACY_600_HEIGHT,
+            bytes_per_line: LEGACY_600_BYTES_PER_LINE,
+            raw_bytes: LEGACY_600_RAW_BYTES,
+        }
+    }
+
     fn root() -> PathBuf {
         std::env::temp_dir().join(format!("beblog-offline-{}", uuid::Uuid::new_v4().simple()))
     }
 
     fn params() -> Vec<u8> {
         b"device=fixture:offline\nformat=RGB\nbytes_per_line=1692\npixels_per_line=564\nlines=850\ndepth=8\nraw_bytes=1438200\nterminal_status=5\n".to_vec()
+    }
+
+    fn params_for(profile: ValidatedRgb8Profile) -> Vec<u8> {
+        format!(
+            "device=fixture:synthetic\nrequested_resolution_dpi={}\nactual_resolution_dpi={}\nformat=RGB\nchannels=3\nbytes_per_line={}\npixels_per_line={}\nlines={}\ndepth=8\nraw_bytes={}\nexpected_raw_bytes={}\nterminal_status=5\n",
+            profile.resolution_dpi,
+            profile.resolution_dpi,
+            profile.bytes_per_line,
+            profile.pixels_per_line,
+            profile.lines,
+            profile.raw_bytes,
+            profile.raw_bytes
+        )
+        .into_bytes()
     }
 
     fn log() -> Vec<u8> {
@@ -971,6 +1149,23 @@ mod tests {
         text.into_bytes()
     }
 
+    fn log_for(frame: u8, profile: ValidatedRgb8Profile) -> Vec<u8> {
+        format!(
+            "sane_init -> 0 (Success)\nsane_open (only call) -> 0 (Success)\nframe descriptor range=1..6 quant=1\nsane_control_option(frame, SET={frame}) -> 0 (Success)\nsane_control_option(mode, SET='Color') -> 0 (Success)\nsane_control_option(resolution, SET={}) -> 0 (Success)\nsane_control_option(resolution, GET={}) -> 0 (Success), info=0x0\nparameters(pre): format=RGB last=1 bpl={} pixels={} lines={} depth=8\nsane_start (only call) -> 0 (Success)\nparameters(post): format=RGB last=1 bpl={} pixels={} lines={} depth=8\nsane_read -> 0 (Success), bytes={}\nsane_read -> 5 (End of file reached), bytes=0\ncapture ended: total={} terminal=5 (End of file reached)\nmetadata fixture.params.txt -> written\nTIFF fixture.tiff -> written\nsane_close\nsane_exit\nclient exit -> 0 (Success)\n",
+            profile.resolution_dpi,
+            profile.resolution_dpi,
+            profile.bytes_per_line,
+            profile.pixels_per_line,
+            profile.lines,
+            profile.bytes_per_line,
+            profile.pixels_per_line,
+            profile.lines,
+            profile.raw_bytes,
+            profile.raw_bytes
+        )
+        .into_bytes()
+    }
+
     fn put16(bytes: &mut [u8], offset: usize, value: u16) {
         bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
     }
@@ -979,17 +1174,28 @@ mod tests {
     }
 
     fn tiff(raw: &[u8], compression: u16, corrupt_ifd: bool, truncate: bool) -> Vec<u8> {
-        // Minimal little-endian, one-strip, uncompressed RGB TIFF for the fixed profile.
+        tiff_for(raw, compression, corrupt_ifd, truncate, WIDTH, HEIGHT)
+    }
+
+    fn tiff_for(
+        raw: &[u8],
+        compression: u16,
+        corrupt_ifd: bool,
+        truncate: bool,
+        width: u32,
+        height: u32,
+    ) -> Vec<u8> {
+        // Synthetic minimal little-endian one-strip RGB8 TIFF.
         let tags: [(u16, u16, u32, u32); 11] = [
-            (256, 4, 1, WIDTH),
-            (257, 4, 1, HEIGHT),
+            (256, 4, 1, width),
+            (257, 4, 1, height),
             (258, 3, 3, 0),
             (259, 3, 1, compression.into()),
             (262, 3, 1, 2),
             (273, 4, 1, 0),
             (277, 3, 1, 3),
-            (278, 4, 1, HEIGHT),
-            (279, 4, 1, RAW_BYTES as u32),
+            (278, 4, 1, height),
+            (279, 4, 1, raw.len() as u32),
             (284, 3, 1, 1),
             (339, 3, 3, 0),
         ];
@@ -997,7 +1203,7 @@ mod tests {
         let ifd_end = ifd + 2 + tags.len() * 12 + 4;
         let bits_at = ifd_end;
         let data_at = bits_at + 6;
-        let sample_format_at = data_at + RAW_BYTES;
+        let sample_format_at = data_at + raw.len();
         let mut bytes = vec![0_u8; sample_format_at + 6];
         bytes[..2].copy_from_slice(b"II");
         put16(&mut bytes, 2, 42);
@@ -1027,7 +1233,7 @@ mod tests {
         put16(&mut bytes, sample_format_at, 1);
         put16(&mut bytes, sample_format_at + 2, 1);
         put16(&mut bytes, sample_format_at + 4, 1);
-        bytes[data_at..data_at + RAW_BYTES].copy_from_slice(raw);
+        bytes[data_at..data_at + raw.len()].copy_from_slice(raw);
         if corrupt_ifd {
             put32(&mut bytes, 4, u32::MAX);
         }
@@ -1123,7 +1329,7 @@ mod tests {
         let mut matching_tiff = tiff(&raw, 1, false, false);
         assert!(validate_artifact_bytes(1, &raw, &matching_tiff, &params(), &log()).is_ok());
 
-        let pixel_range = validate_tiff_profile(&matching_tiff).unwrap();
+        let pixel_range = validate_tiff_profile(&matching_tiff, legacy_600_profile()).unwrap();
         matching_tiff[pixel_range.start + 123] ^= 1;
         assert!(validate_artifact_bytes(1, &raw, &matching_tiff, &params(), &log()).is_err());
 
@@ -1133,6 +1339,164 @@ mod tests {
         assert!(
             validate_artifact_bytes(1, &changed_raw, &matching_tiff, &params(), &log()).is_err()
         );
+    }
+
+    #[test]
+    fn synthetic_2820_profile_accepts_variable_consistent_rgb8_geometry() {
+        let profile = ValidatedRgb8Profile {
+            resolution_dpi: 2820,
+            pixels_per_line: 1200,
+            lines: 1800,
+            bytes_per_line: 3600,
+            raw_bytes: 6_480_000,
+        };
+        let raw = vec![0x5a; profile.raw_bytes as usize];
+        let tiff = tiff_for(
+            &raw,
+            1,
+            false,
+            false,
+            profile.pixels_per_line,
+            profile.lines,
+        );
+        let validated =
+            validate_artifact_profile(2, &raw, &tiff, &params_for(profile), &log_for(2, profile))
+                .unwrap();
+        assert_eq!(validated, profile);
+    }
+
+    #[test]
+    fn synthetic_2820_profile_archives_with_offline_classification_and_geometry() {
+        let root = root();
+        let archive = ArchiveManager::new(root.clone());
+        let profile = ValidatedRgb8Profile {
+            resolution_dpi: 2820,
+            pixels_per_line: 1200,
+            lines: 1800,
+            bytes_per_line: 3600,
+            raw_bytes: 6_480_000,
+        };
+        let raw = vec![0x6b; profile.raw_bytes as usize];
+        let tiff = tiff_for(
+            &raw,
+            1,
+            false,
+            false,
+            profile.pixels_per_line,
+            profile.lines,
+        );
+        let sources = write_sources(
+            &root.join("synthetic-2820-input"),
+            &raw,
+            &tiff,
+            &params_for(profile),
+            &log_for(3, profile),
+        );
+        let report = import_offline_artifacts(&archive, 3, &sources).unwrap();
+        assert_eq!(report.manifest.resolution_dpi, 2820);
+        assert_eq!(report.manifest.expected_raw_bytes, profile.raw_bytes);
+        assert_eq!(report.manifest.capture_kind, CaptureKind::OfflineImport);
+        assert_eq!(report.manifest.status, ArchiveStatus::Completed);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn dynamic_profile_rejects_conflicting_geometry_and_wrong_raw_length() {
+        let profile = ValidatedRgb8Profile {
+            resolution_dpi: 2820,
+            pixels_per_line: 1200,
+            lines: 1800,
+            bytes_per_line: 3600,
+            raw_bytes: 6_480_000,
+        };
+        let raw = vec![0x33; profile.raw_bytes as usize];
+        let tiff = tiff_for(
+            &raw,
+            1,
+            false,
+            false,
+            profile.pixels_per_line,
+            profile.lines,
+        );
+
+        let wrong_stride = params_for(ValidatedRgb8Profile {
+            bytes_per_line: 3599,
+            ..profile
+        });
+        assert!(
+            validate_artifact_bytes(1, &raw, &tiff, &wrong_stride, &log_for(1, profile)).is_err()
+        );
+        assert!(validate_artifact_bytes(
+            1,
+            &raw[..raw.len() - 1],
+            &tiff,
+            &params_for(profile),
+            &log_for(1, profile),
+        )
+        .is_err());
+        let wrong_dpi = params_for(ValidatedRgb8Profile {
+            resolution_dpi: 600,
+            ..profile
+        });
+        assert!(validate_artifact_bytes(1, &raw, &tiff, &wrong_dpi, &log_for(1, profile)).is_err());
+        let wrong_expected = String::from_utf8(params_for(profile))
+            .unwrap()
+            .replace("expected_raw_bytes=6480000", "expected_raw_bytes=6480001");
+        assert!(validate_artifact_bytes(
+            1,
+            &raw,
+            &tiff,
+            wrong_expected.as_bytes(),
+            &log_for(1, profile),
+        )
+        .is_err());
+        assert!(validate_artifact_bytes(
+            1,
+            &raw,
+            &tiff_for(
+                &raw,
+                1,
+                false,
+                false,
+                profile.pixels_per_line + 1,
+                profile.lines
+            ),
+            &params_for(profile),
+            &log_for(1, profile),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn geometry_validation_rejects_integer_overflow_and_unbounded_dimensions() {
+        let raw = [0; 1];
+        let base = std::collections::BTreeMap::from([
+            ("device".into(), "fixture".into()),
+            ("format".into(), "RGB".into()),
+            ("depth".into(), "8".into()),
+            ("terminal_status".into(), "5".into()),
+            ("raw_bytes".into(), "1".into()),
+            ("requested_resolution_dpi".into(), "2820".into()),
+            ("pixels_per_line".into(), u32::MAX.to_string()),
+            ("lines".into(), "1".into()),
+            ("bytes_per_line".into(), "4294967295".into()),
+        ]);
+        assert!(validate_profile_metadata(&base, 1, raw.len() as u64).is_err());
+
+        let huge = base
+            .into_iter()
+            .map(|(key, value)| {
+                let replacement = match key.as_str() {
+                    "pixels_per_line" => "100000".to_string(),
+                    "bytes_per_line" => "300000".to_string(),
+                    "lines" => "100000".to_string(),
+                    "raw_bytes" => "30000000000".to_string(),
+                    _ => value,
+                };
+                (key, replacement)
+            })
+            .collect();
+        assert!(validate_profile_metadata(&huge, 1, raw.len() as u64).is_err());
     }
 
     #[test]
@@ -1197,7 +1561,9 @@ mod tests {
     fn archive_collision_preserves_existing_capture_file_and_marks_import_failed() {
         let root = root();
         let archive = ArchiveManager::new(root.clone());
-        let pending = archive.begin_offline_import(1).unwrap();
+        let pending = archive
+            .begin_offline_import(1, legacy_600_profile())
+            .unwrap();
         let raw_path = pending.directory.join("capture.raw");
         fs::write(&raw_path, b"pre-existing original").unwrap();
         let error = archive
@@ -1208,6 +1574,7 @@ mod tests {
                     tiff: tiff(&vec![9; RAW_BYTES], 1, false, false),
                     params_txt: params(),
                     client_log: log(),
+                    profile: legacy_600_profile(),
                 },
             )
             .unwrap_err();
