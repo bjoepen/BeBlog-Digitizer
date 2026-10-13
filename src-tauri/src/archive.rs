@@ -105,6 +105,7 @@ pub struct OfflineCaptureProduct {
     pub tiff: Vec<u8>,
     pub params_txt: Vec<u8>,
     pub client_log: Vec<u8>,
+    pub(crate) profile: crate::offline_import::ValidatedRgb8Profile,
 }
 
 #[derive(Clone)]
@@ -146,10 +147,21 @@ impl ArchiveManager {
         kind: CaptureKind,
     ) -> io::Result<PendingCapture> {
         ensure_public_capture_kind(kind)?;
-        self.begin_with_id(&Self::next_capture_id(), request, kind, None)
+        self.begin_with_id(
+            &Self::next_capture_id(),
+            request,
+            kind,
+            None,
+            600,
+            1_438_200,
+        )
     }
 
-    pub(crate) fn begin_offline_import(&self, frame: u8) -> io::Result<PendingCapture> {
+    pub(crate) fn begin_offline_import(
+        &self,
+        frame: u8,
+        profile: crate::offline_import::ValidatedRgb8Profile,
+    ) -> io::Result<PendingCapture> {
         if !(1..=4).contains(&frame) {
             return Err(invalid_data(
                 "Offline-Import unterstützt in D3-B3a nur Frames 1–4",
@@ -161,7 +173,14 @@ impl ArchiveManager {
         };
         for _ in 0..BATCH_ID_ATTEMPTS {
             let id = format!("offline-{}", uuid::Uuid::new_v4().simple());
-            match self.begin_with_id(&id, &request, CaptureKind::OfflineImport, None) {
+            match self.begin_with_id(
+                &id,
+                &request,
+                CaptureKind::OfflineImport,
+                None,
+                profile.resolution_dpi,
+                profile.raw_bytes,
+            ) {
                 Ok(pending) => return Ok(pending),
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(error),
@@ -185,6 +204,8 @@ impl ArchiveManager {
             request,
             kind,
             Some(batch_id.to_string()),
+            600,
+            1_438_200,
         )
     }
 
@@ -289,6 +310,8 @@ impl ArchiveManager {
         request: &StartScanRequest,
         kind: CaptureKind,
         batch_id: Option<String>,
+        resolution_dpi: u16,
+        expected_raw_bytes: u64,
     ) -> io::Result<PendingCapture> {
         fs::create_dir_all(&self.root)?;
         let directory = self.root.join(id);
@@ -301,8 +324,8 @@ impl ArchiveManager {
             capture_kind: kind,
             frame: request.frame,
             pixel_format: "RGB8".into(),
-            resolution_dpi: 600,
-            expected_raw_bytes: 1_438_200,
+            resolution_dpi,
+            expected_raw_bytes,
             files: Vec::new(),
             failure: None,
         };
@@ -545,13 +568,20 @@ impl ArchiveManager {
         {
             return Err(invalid_data("Capture ist kein offener Offline-Import"));
         }
-        crate::offline_import::validate_artifact_bytes(
+        let validated_profile = crate::offline_import::validate_artifact_profile(
             manifest.frame,
             &product.raw,
             &product.tiff,
             &product.params_txt,
             &product.client_log,
         )?;
+        if product.profile != validated_profile {
+            return Err(invalid_data(
+                "Übergebene Offline-Profilangabe stimmt nicht mit den Artefakten überein",
+            ));
+        }
+        manifest.resolution_dpi = validated_profile.resolution_dpi;
+        manifest.expected_raw_bytes = validated_profile.raw_bytes;
         let artifacts = [
             (
                 "capture.raw",
@@ -883,6 +913,8 @@ mod tests {
                 request,
                 CaptureKind::Production,
                 None,
+                600,
+                1_438_200,
             )
             .unwrap()
     }
@@ -900,11 +932,25 @@ mod tests {
         let root = temp_root("collision");
         let archive = ArchiveManager::new(root.clone());
         archive
-            .begin_with_id("fixed", &request(), CaptureKind::Simulation, None)
+            .begin_with_id(
+                "fixed",
+                &request(),
+                CaptureKind::Simulation,
+                None,
+                600,
+                1_438_200,
+            )
             .unwrap();
         assert_eq!(
             archive
-                .begin_with_id("fixed", &request(), CaptureKind::Simulation, None)
+                .begin_with_id(
+                    "fixed",
+                    &request(),
+                    CaptureKind::Simulation,
+                    None,
+                    600,
+                    1_438_200
+                )
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::AlreadyExists
@@ -1042,6 +1088,8 @@ mod tests {
                 &request(),
                 CaptureKind::Production,
                 None,
+                600,
+                1_438_200,
             )
             .unwrap();
         let error = archive
