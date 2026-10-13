@@ -3,12 +3,15 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
+source "$REPO_ROOT/tools/process-timeout.sh"
 CLIENT="$REPO_ROOT/src-tauri/target/minolta-hardware-test/minolta-batch-frame"
 TRUST_FILE="$REPO_ROOT/tools/minolta-hardware-test.sha256"
 FRAME=1
 DPI=2820
 HOLDER_TIMEOUT=120
 POLL_INTERVAL=2
+TOTAL_TIMEOUT_SECONDS=1200
+TERMINATION_GRACE_SECONDS=15
 
 usage() {
     echo "Usage: $0 EXACT_SANE_DEVICE_IDENTIFIER" >&2
@@ -58,6 +61,7 @@ echo "  SHA-256: $ACTUAL_HASH"
 echo "  Device: $DEVICE"
 echo "  Profile: frame=$FRAME, RGB8, requested DPI=$DPI"
 echo "  Holder poll only: timeout=${HOLDER_TIMEOUT}s, interval=${POLL_INTERVAL}s"
+echo "  Full-process timeout: ${TOTAL_TIMEOUT_SECONDS}s; SIGTERM cleanup grace: ${TERMINATION_GRACE_SECONDS}s"
 echo "  Client will be started exactly once; no retries or resume."
 read -r -p "Type the exact device identifier to confirm: " DEVICE_CONFIRM
 if [[ "$DEVICE_CONFIRM" != "$DEVICE" ]]; then
@@ -78,26 +82,42 @@ OUTPUT_ROOT="$HOME/Documents/BeBlog Digitizer Hardware Tests"
 /bin/mkdir -p "$OUTPUT_ROOT"
 OUTPUT_DIR="$(/usr/bin/mktemp -d "$OUTPUT_ROOT/frame1-2820-XXXXXXXX")"
 PREFIX="$OUTPUT_DIR/capture"
-printf 'output_directory=%s\nclient_sha256=%s\ndevice=%s\nframe=%s\nrequested_dpi=%s\ncolor=RGB8\nholder_timeout_seconds=%s\npoll_interval_seconds=%s\n' \
-    "$OUTPUT_DIR" "$ACTUAL_HASH" "$DEVICE" "$FRAME" "$DPI" "$HOLDER_TIMEOUT" "$POLL_INTERVAL" > "$OUTPUT_DIR/test-plan.txt"
+printf 'output_directory=%s\nclient_sha256=%s\ndevice=%s\nframe=%s\nrequested_dpi=%s\ncolor=RGB8\nholder_poll_timeout_seconds=%s\npoll_interval_seconds=%s\nprocess_total_timeout_seconds=%s\ntermination_grace_seconds=%s\n' \
+    "$OUTPUT_DIR" "$ACTUAL_HASH" "$DEVICE" "$FRAME" "$DPI" "$HOLDER_TIMEOUT" "$POLL_INTERVAL" \
+    "$TOTAL_TIMEOUT_SECONDS" "$TERMINATION_GRACE_SECONDS" > "$OUTPUT_DIR/test-plan.txt"
 
-echo "Starting one Minolta client process now. This is not a full-scan timeout: -t only bounds holder polling."
-set +e
-"$CLIENT" -d "$DEVICE" -o "$PREFIX" -f "$FRAME" -r "$DPI" -t "$HOLDER_TIMEOUT" -i "$POLL_INTERVAL" \
-    > "$OUTPUT_DIR/stdout.txt" 2> "$OUTPUT_DIR/stderr.txt"
-CLIENT_STATUS=$?
-set -e
+echo "Starting one Minolta client process once; total timeout=${TOTAL_TIMEOUT_SECONDS}s, TERM grace=${TERMINATION_GRACE_SECONDS}s."
+echo "The client -t=$HOLDER_TIMEOUT remains only the holder-detection timeout."
+beblog_run_with_timeout "$TOTAL_TIMEOUT_SECONDS" "$TERMINATION_GRACE_SECONDS" \
+    "$OUTPUT_DIR/stdout.txt" "$OUTPUT_DIR/stderr.txt" "$CLIENT" \
+    -d "$DEVICE" -o "$PREFIX" -f "$FRAME" -r "$DPI" -t "$HOLDER_TIMEOUT" -i "$POLL_INTERVAL"
+CLIENT_STATUS="$BEBLOG_PROCESS_EXIT"
 
-printf 'os_exit_code=%s\n' "$CLIENT_STATUS" >> "$OUTPUT_DIR/test-plan.txt"
-for suffix in client.log raw params.txt tiff; do
-    artifact="$PREFIX.$suffix"
-    if [[ -f "$artifact" && ! -L "$artifact" ]]; then
-        /usr/bin/stat -f 'artifact=%N bytes=%z' "$artifact" >> "$OUTPUT_DIR/test-plan.txt"
-        /usr/bin/shasum -a 256 "$artifact" >> "$OUTPUT_DIR/test-plan.txt"
+{
+    printf 'termination_reason=%s\nclient_wait_status=%s\nsigterm_sent=%s\nsigkill_sent=%s\n' \
+        "$BEBLOG_PROCESS_CAUSE" "$CLIENT_STATUS" "$BEBLOG_PROCESS_TERM_SENT" "$BEBLOG_PROCESS_KILL_SENT"
+    if [[ "$BEBLOG_PROCESS_CAUSE" == timeout || "$BEBLOG_PROCESS_CAUSE" == cancelled_* ||
+          "$BEBLOG_PROCESS_CAUSE" == start_failed || "$CLIENT_STATUS" -ne 0 ]]; then
+        echo 'capture_status=INCOMPLETE'
     else
-        printf 'artifact_missing_or_invalid=%s\n' "$artifact" >> "$OUTPUT_DIR/test-plan.txt"
+        echo 'capture_status=PENDING_OFFLINE_ARTIFACT_VALIDATION'
     fi
-done
-echo "One process ended with OS exit code $CLIENT_STATUS. Results: $OUTPUT_DIR"
-echo "Do not retry automatically. Validate all four artifacts with the offline importer; this script does not declare them a Production capture."
-exit "$CLIENT_STATUS"
+} >> "$OUTPUT_DIR/test-plan.txt"
+beblog_record_artifacts "$PREFIX" "$OUTPUT_DIR/test-plan.txt"
+if [[ "$BEBLOG_MISSING_ARTIFACT_COUNT" -gt 0 ]]; then
+    printf 'capture_status=INCOMPLETE_MISSING_ARTIFACTS\nmissing_artifact_count=%s\n' \
+        "$BEBLOG_MISSING_ARTIFACT_COUNT" >> "$OUTPUT_DIR/test-plan.txt"
+fi
+
+echo "Process wait status: $CLIENT_STATUS; termination reason: $BEBLOG_PROCESS_CAUSE; results: $OUTPUT_DIR"
+echo "No retry is performed. All artifacts require offline validation; this launcher never marks a Production or completed capture."
+case "$BEBLOG_PROCESS_CAUSE" in
+    timeout) exit 124 ;;
+    cancelled_sigint) exit 130 ;;
+    cancelled_sigterm) exit 143 ;;
+    start_failed) exit 127 ;;
+esac
+if [[ "$CLIENT_STATUS" -ne 0 || "$BEBLOG_MISSING_ARTIFACT_COUNT" -gt 0 ]]; then
+    exit 1
+fi
+exit 0
