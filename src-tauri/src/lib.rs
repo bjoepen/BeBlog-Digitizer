@@ -5,7 +5,6 @@ mod log_parser;
 mod model;
 pub mod offline_import;
 mod process;
-#[allow(dead_code)] // Intentionally dormant; no production command consumes a resolved sidecar.
 mod sidecar;
 mod state_machine;
 
@@ -60,6 +59,13 @@ fn cancel_batch(app: AppHandle, core: State<'_, AppCore>) -> Result<(), String> 
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
+            let resource_dir = app.path().resource_dir()?;
+            sidecar::SidecarResolver::resolve(
+                &resource_dir,
+                sidecar::SidecarResource::Arm64Test,
+                sidecar::trusted_arm64_test_sidecar(),
+            )
+            .map_err(std::io::Error::other)?;
             let archive_root = app.path().app_local_data_dir()?.join("scan-archive");
             let core = AppCore::new(archive_root);
             core.recover_archive().map_err(std::io::Error::other)?;
