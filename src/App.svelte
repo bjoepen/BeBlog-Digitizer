@@ -28,20 +28,18 @@
     let unlisten: UnlistenFn | undefined;
     void listen<HardwareClientEvent>("hardware-client-event", ({ payload }) => {
       projection = projectHardwareEvent(projection, payload);
-      events = [...events.slice(-99), { label: payload.kind, detail: payload.kind === "dataChunk" ? `${payload.totalBytes.toLocaleString("de-DE")} Byte übertragen` : payload.kind === "error" || payload.kind === "openFailed" || payload.kind === "processFailed" ? payload.detail : payload.kind === "diagnostic" ? `[${payload.stream}] ${payload.message}` : payload.kind === "artifactsExported" ? payload.directory : payload.kind === "processExited" ? `OS-Exitcode ${payload.exitCode}` : payload.kind }];
+      events = [...events.slice(-99), { label: payload.kind === "holderConfirmationAccepted" ? "Benutzerbestätigung" : payload.kind, detail: payload.kind === "holderConfirmationAccepted" ? "Einsetzen durch Benutzer bestätigt; Haltererkennung folgt getrennt." : payload.kind === "dataChunk" ? `${payload.totalBytes.toLocaleString("de-DE")} Byte übertragen` : payload.kind === "error" || payload.kind === "openFailed" || payload.kind === "processFailed" ? payload.detail : payload.kind === "diagnostic" ? `[${payload.stream}] ${payload.message}` : payload.kind === "artifactsExported" ? payload.directory : payload.kind === "processExited" ? `OS-Exitcode ${payload.exitCode}` : payload.kind }];
       if (payload.kind === "artifactsExported") exportNotice = `Validierte Dateien exportiert: ${payload.directory}`;
     }).then((fn) => { if (disposed) fn(); else unlisten = fn; });
     return () => { disposed = true; unlisten?.(); };
   });
 
   async function confirmInserted() {
-    const previousProjection = projection;
-    projection = confirmHolderInsertion(projection);
+    const confirmedProjection = confirmHolderInsertion(projection);
+    if (confirmedProjection.state !== "waitingForHolderDetection") return;
     try {
       await invoke("confirm_guided_holder");
-      events = [...events, { label: "Benutzerbestätigung", detail: "Einsetzen bestätigt; dies ist noch keine Haltererkennung." }];
     } catch (error) {
-      if (projection.state === "waitingForHolderDetection") projection = previousProjection;
       events = [...events, { label: "Bestätigung abgelehnt", detail: String(error), error: true }];
     }
   }

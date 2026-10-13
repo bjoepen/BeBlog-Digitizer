@@ -2,7 +2,15 @@
 
 **Basis:** D3-B5c `c73c9c7fb1ce0905944e83b75247a7aa6cfb0be1`
 **Branch:** `build/001-d4-guided-hardware-workflow`
-**Status:** guided process/UI/artifact integration implemented and hardware-free tested. Real client start is deliberately blocked pending independent hash approval. The visual native-app check remains OPEN because the desktop inspection bridge did not attach to the built app.
+**Status:** guided process/UI/artifact integration implemented, hardware-free tested, and in the native ARM64 app visually exercised through validated export. Real client start remains deliberately blocked pending independent hash approval.
+
+## D4a – Korrektur nach nativem GUI-Test
+
+- **Root cause:** Nach Empfang von `OPENED` nahm der Prozessrunner `CONTINUE` entgegen und schrieb es an stdin, rief aber nicht `GuidedProtocol::confirm_insertion()` auf. Der Core blieb dadurch in `AwaitingHolderConfirmation`; das darauffolgende gültige `HOLDER_DETECTED` wurde als unzulässiger Übergang abgelehnt. Der Fehlerpfad setzte Cancellation und rief anschließend die Terminierung auf.
+- **EPERM:** Die Terminierung sendete Signale an `kill(-pid, ...)` und unterstellte damit, der Kind-PID sei verlässlich die gewünschte Prozessgruppen-ID. Unter dem beobachteten App-Lauf schlug diese Annahme mit `EPERM` fehl. D4 verarbeitet einen einzelnen Clientprozess ohne erforderliche Kindprozesse; die Korrektur entfernt die nicht belegte Prozessgruppenannahme und signalisiert den von `Child` gehaltenen PID direkt. Nicht-`ESRCH`-Fehler wie `EPERM` bleiben harte Fehler. `ESRCH` wird nur nach zusätzlicher Exitbeobachtung und erfolgreichem `wait()` als bereits beendeter Prozess behandelt; Reapingfehler werden weitergereicht.
+- Die Bestätigung wird nun im Worker nur bei einem tatsächlichen `Continue`-Steuerereignis durch `GuidedProtocol::confirm_insertion()` validiert. Erst nach erfolgreichem Schreiben des Handshake-Tokens meldet der Core `holderConfirmationAccepted`; die Svelte-Projektion wechselt nicht mehr optimistisch und protokolliert keine Bestätigung automatisch nach `OPENED`. Wiederholte Bestätigungen werden abgewehrt.
+- **Zusätzlicher nativer UI-Befund:** Die Ereignis-Enum-Varianten waren camelCase, ihre Rust-Felder aber nicht. Dadurch kamen z. B. `expected_bytes`/`total_bytes`/`exit_code` statt der Svelte-Vertragsnamen an; die Oberfläche zeigte keinen Transferstand und `OS-Exitcode undefined`, obwohl der Archivexport gelang. `rename_all_fields = "camelCase"` und ein Serialisierungstest schließen diese Schnittstellenlücke.
+- Regressionen prüfen, dass vor `OPENED` kein Token geschrieben wird, ein bestätigter Übergang denselben Protokollzustand fortschaltet, ein zweites Token abgewiesen wird, SIGTERM den direkten harmlosen Kindprozess beendet und reap-t, die Rust-Eventfelder dem camelCase-Frontendvertrag entsprechen sowie dass der Simulator am `OPENED`-Barrierpunkt ohne explizites `CONTINUE` weiterläuft.
 
 ## Ausgangsaudit
 
@@ -54,21 +62,20 @@ Die angepasste Arbeitskopie wurde mit Apple Clang/SDK und ausschließlich lesend
 
 Aktuelle hardwarefreie Prüfmatrix:
 
-- Rust-Tests: 105 Unit-Tests bestanden, 0 fehlgeschlagen, 12 bestehende ignorierte Child-Modi; zusätzlich 1 echter Kindprozess-End-to-End-Test bestanden.
+- Rust-Tests nach D4a: 109 Unit-Tests bestanden, 0 fehlgeschlagen, 12 bestehende ignorierte Child-Modi; zusätzlich 1 echter Kindprozess-End-to-End-Test bestanden.
 - Rust-Formatierung: PASS.
 - Clippy `-D warnings`: PASS.
 - TypeScript: PASS.
-- Frontend: 14 Tests in 4 Dateien PASS.
+- Frontend: 15 Tests in 4 Dateien PASS.
 - Vite-Build: PASS.
 - ARM64 C-Clientbuild, Ad-hoc-Signatur und statische Inspektion: PASS; Binary nicht gestartet.
 - Nativer Tauri-ARM64-App-Build: PASS; App-Binary ist `arm64`. Das `.app` enthält das D3-B4-Test-Sidecar und den ARM64-Minolta-Kandidaten unter `Contents/Resources/sidecars/macos-aarch64/`; der Kandidat wurde nicht gestartet.
 - `git diff --check`: PASS.
-- Native visuelle App-Prüfung: **OPEN/FAIL für Abnahme**. Der Computer-Use-Accessibility-Aufruf hing und die App erschien nicht als laufender Prozess; es wurde kein Screenshot oder visueller PASS behauptet. Der GUI-Eventvertrag ist durch Svelte-Tests abgedeckt, der echte native Fensterlauf noch nicht.
+- Native visuelle App-Prüfung nach D4a: **PASS für den Simulatorpfad**. In der gebauten ARM64-`.app` wurde `/Volumes/Kioxia/BeBlog Digitizer Test` ausgewählt, der Simulator gestartet, `OPENED` abgewartet und die Bestätigung manuell betätigt. Sichtbar waren `Im Simulator erkannt`, `28.800 / 28.800 Byte`, OS-Exitcode 0, `Scan abgeschlossen` und der erfolgreiche Export nach `/Volumes/Kioxia/BeBlog Digitizer Test/BeBlog-Scan-2d0e30efaa154388bd0cfe10e3c3d8bf`. Ein Screenshot wurde nicht ins Repository übernommen.
 
 ## Offene Punkte / Freigabegates
 
 - **BLOCKER für reale Hardwareausführung:** unabhängige Freigabe des exakten Clienthashs `9049…44c6`. Keine automatische Hashübernahme ist implementiert.
-- **OPEN für visuellen Build-PASS:** nativer `.app`-Fensterstart und Klickpfad konnten über die verfügbare Computer-Use-Accessibility-Brücke nicht abgeschlossen werden. Der nächste Abnahmeschritt muss die native UI öffnen und den Simulator-Button bis zum sichtbaren Exportstatus durchspielen.
 - **OPEN:** Geräteauswahl ist manuelle Gerätekennung plus exakte App-Bestätigung; automatische SANE-Geräteentdeckung wurde bewusst nicht hinzugefügt.
 - **OPEN:** erfolgreiche reale Scans werden aktuell konservativ als `OfflineImport` archiviert; `Production` bleibt gesperrt, bis OS-Prozessnachweis, reale Artefakte und SANE-Cleanup-Vertrag gemeinsam geprüft sind.
 - **OPEN:** 2.820-dpi-Geometrie/Artefakte sind weiterhin nicht hardwarebestätigt.

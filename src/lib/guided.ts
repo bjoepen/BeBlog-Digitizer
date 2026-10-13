@@ -1,6 +1,7 @@
 export type HardwareClientEvent =
   | { kind: "opened" }
   | { kind: "openFailed"; detail: string }
+  | { kind: "holderConfirmationAccepted" }
   | { kind: "holderDetected" }
   | { kind: "framePositioned"; frame: number }
   | { kind: "parameters"; dpi: number; width: number; height: number; bytesPerLine: number; depth: number; format: string; expectedBytes: number }
@@ -43,6 +44,10 @@ export function projectHardwareEvent(current: GuidedProjection, event: HardwareC
     case "openFailed":
     case "error":
       return { ...current, state: "failed", error: event.detail };
+    case "holderConfirmationAccepted":
+      return current.state === "awaitingHolderConfirmation"
+        ? { ...current, state: "waitingForHolderDetection" }
+        : current;
     case "processFailed":
       return current.state === "cancelled" || current.state === "timedOut"
         ? current

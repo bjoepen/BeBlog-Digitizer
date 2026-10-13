@@ -39,6 +39,12 @@ fn child_simulator_handshake_events_validate_archive_and_export_all_artifacts() 
     stdout.read_line(&mut line).unwrap();
     assert_eq!(line.trim_end(), "BEBLOG/1\tOPENED");
     events.push(line.trim_end().to_string());
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    assert_eq!(
+        child.try_wait().unwrap(),
+        None,
+        "child must remain blocked at OPENED until the explicit user continuation"
+    );
     child
         .stdin
         .as_mut()

@@ -43,9 +43,14 @@ pub(crate) struct GuidedScanRequest {
 }
 
 #[derive(Debug, Clone, Serialize)]
-#[serde(tag = "kind", rename_all = "camelCase")]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 enum GuidedUiEvent {
     Opened,
+    HolderConfirmationAccepted,
     OpenFailed {
         detail: String,
     },
@@ -104,6 +109,7 @@ pub(crate) struct GuidedProcessController {
 struct ActiveSession {
     run_id: String,
     opened: Arc<AtomicBool>,
+    confirmation_sent: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
     control: Sender<ControlMessage>,
 }
@@ -198,6 +204,7 @@ impl GuidedProcessController {
     ) -> Result<String, String> {
         let run_id = uuid::Uuid::new_v4().to_string();
         let opened = Arc::new(AtomicBool::new(false));
+        let confirmation_sent = Arc::new(AtomicBool::new(false));
         let (control_tx, control_rx) = mpsc::channel();
         {
             let mut active = self
@@ -210,6 +217,7 @@ impl GuidedProcessController {
             *active = Some(ActiveSession {
                 run_id: run_id.clone(),
                 opened: opened.clone(),
+                confirmation_sent: confirmation_sent.clone(),
                 cancelled: cancelled.clone(),
                 control: control_tx,
             });
@@ -256,10 +264,13 @@ impl GuidedProcessController {
                 "Filmhalter kann erst nach dem echten OPENED-Ereignis bestätigt werden".into(),
             );
         }
-        session
-            .control
-            .send(ControlMessage::Continue)
-            .map_err(|_| "Scannerprozess nimmt keine Fortsetzung mehr an".into())
+        if session.confirmation_sent.swap(true, Ordering::SeqCst) {
+            return Err("Filmhalterbestätigung wurde bereits gesendet".into());
+        }
+        session.control.send(ControlMessage::Continue).map_err(|_| {
+            session.confirmation_sent.store(false, Ordering::SeqCst);
+            "Scannerprozess nimmt keine Fortsetzung mehr an".into()
+        })
     }
 
     pub(crate) fn cancel(&self) -> Result<(), String> {
@@ -370,11 +381,6 @@ fn run_client(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
     let mut child = command
         .spawn()
         .map_err(|error| format!("Minolta-Client konnte nicht gestartet werden: {error}"))?;
@@ -385,32 +391,6 @@ fn run_client(
     let (reader_tx, reader_rx) = mpsc::channel();
     let stdout_reader = spawn_reader(stdout, true, reader_tx.clone());
     let stderr_reader = spawn_reader(stderr, false, reader_tx);
-    let writer_opened = opened.clone();
-    let writer_cancelled = cancelled.clone();
-    let (writer_tx, writer_rx) = mpsc::channel();
-    let writer = thread::spawn(move || {
-        while let Ok(message) = writer_rx.recv() {
-            match message {
-                ControlMessage::Continue if writer_opened.load(Ordering::SeqCst) => {
-                    if stdin
-                        .write_all(b"CONTINUE\n")
-                        .and_then(|_| stdin.flush())
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                ControlMessage::Cancel => {
-                    let _ = stdin.write_all(b"CANCEL\n");
-                    let _ = stdin.flush();
-                    break;
-                }
-                ControlMessage::Continue => {}
-            }
-        }
-        drop(stdin);
-        writer_cancelled.load(Ordering::SeqCst)
-    });
     emit(
         &app,
         GuidedUiEvent::Diagnostic {
@@ -426,10 +406,27 @@ fn run_client(
     let mut terminal_error = None;
     while status.is_none() {
         while let Ok(message) = controls.try_recv() {
-            if writer_tx.send(message).is_err() {
-                terminal_error = Some("stdin-Handshakekanal wurde geschlossen".into());
-                cancelled.store(true, Ordering::SeqCst);
-                break;
+            match message {
+                ControlMessage::Continue => {
+                    if let Err(error) = send_continue_after_opened(
+                        &mut protocol,
+                        opened.load(Ordering::SeqCst),
+                        &mut stdin,
+                    ) {
+                        terminal_error = Some(error);
+                        cancelled.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                    emit(&app, GuidedUiEvent::HolderConfirmationAccepted);
+                }
+                ControlMessage::Cancel => {
+                    if let Err(error) = stdin.write_all(b"CANCEL\n").and_then(|_| stdin.flush()) {
+                        terminal_error =
+                            Some(format!("Abbruchsignal über stdin fehlgeschlagen: {error}"));
+                    }
+                    cancelled.store(true, Ordering::SeqCst);
+                    break;
+                }
             }
         }
         if cancelled.load(Ordering::SeqCst) {
@@ -483,14 +480,14 @@ fn run_client(
                             },
                         ),
                         Ok(event) => {
-                            if let ClientEvent::Opened = event {
-                                opened.store(true, Ordering::SeqCst);
-                            }
                             if let Err(error) = protocol.observe(event.clone()) {
                                 terminal_error =
                                     Some(format!("Ungültige Clientereignisfolge: {error:?}"));
                                 cancelled.store(true, Ordering::SeqCst);
                             } else {
+                                if event == ClientEvent::Opened {
+                                    opened.store(true, Ordering::SeqCst);
+                                }
                                 emit_client_event(&app, event);
                             }
                         }
@@ -531,11 +528,8 @@ fn run_client(
             }
         }
     }
-    // Close control plumbing before final stream drain; the child has exited or was reaped.
-    drop(writer_tx);
-    if writer.join().is_err() {
-        return Err("stdin-Writer konnte nicht erfolgreich beendet werden".into());
-    }
+    // The child has exited or was reaped; close its control pipe before draining readers.
+    drop(stdin);
     let observed_status = status;
     let waited_status = child.wait().map_err(|error| {
         format!("Kindprozess konnte nicht nachweislich gereapt werden: {error}")
@@ -645,26 +639,41 @@ fn spawn_reader<R: io::Read + Send + 'static>(
     })
 }
 
+fn send_continue_after_opened(
+    protocol: &mut GuidedProtocol,
+    opened: bool,
+    stdin: &mut impl Write,
+) -> Result<(), String> {
+    if !opened {
+        return Err("CONTINUE vor OPENED verweigert".into());
+    }
+    let command = protocol
+        .confirm_insertion()
+        .map_err(|error| format!("Benutzerbestätigung in diesem Zustand unzulässig: {error:?}"))?;
+    stdin
+        .write_all(command)
+        .and_then(|_| stdin.flush())
+        .map_err(|error| format!("CONTINUE-Handshake konnte nicht gesendet werden: {error}"))
+}
+
 struct TerminationResult {
     status: ExitStatus,
     forced_kill: bool,
 }
 
 fn terminate_and_reap(child: &mut Child) -> io::Result<TerminationResult> {
-    let pid = child.id() as i32;
+    let pid = i32::try_from(child.id())
+        .map_err(|_| io::Error::other("Child-PID liegt außerhalb des POSIX-Bereichs"))?;
     #[cfg(unix)]
     {
-        if unsafe { libc::kill(-pid, libc::SIGTERM) } != 0 {
+        if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
             let error = io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::ESRCH) {
-                if let Some(status) = child.try_wait()? {
+            if is_no_such_process(&error) {
+                if child.try_wait()?.is_some() {
                     return Ok(TerminationResult {
-                        status: child.wait().unwrap_or(status),
+                        status: child.wait()?,
                         forced_kill: false,
                     });
-                }
-                unsafe {
-                    libc::kill(pid, libc::SIGTERM);
                 }
             } else {
                 return Err(error);
@@ -674,7 +683,12 @@ fn terminate_and_reap(child: &mut Child) -> io::Result<TerminationResult> {
     let until = Instant::now() + TERMINATION_GRACE;
     while Instant::now() < until {
         if let Some(status) = child.try_wait()? {
-            let waited = child.wait().unwrap_or(status);
+            let waited = child.wait()?;
+            if waited != status {
+                return Err(io::Error::other(
+                    "try_wait- und wait-Status widersprechen sich",
+                ));
+            }
             return Ok(TerminationResult {
                 status: waited,
                 forced_kill: false,
@@ -683,22 +697,20 @@ fn terminate_and_reap(child: &mut Child) -> io::Result<TerminationResult> {
         thread::sleep(Duration::from_millis(50));
     }
     #[cfg(unix)]
-    {
-        if unsafe { libc::kill(-pid, libc::SIGKILL) } != 0 {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::ESRCH) {
-                child.kill()?;
-            }
-            if child.try_wait()?.is_none() {
-                child.kill()?;
-            }
-        }
+    if child.try_wait()?.is_none() {
+        // Target the child owned by this handle; do not infer process-group
+        // membership from its PID. Permission failures remain hard failures.
+        child.kill()?;
     }
     let status = child.wait()?;
     Ok(TerminationResult {
         status,
         forced_kill: true,
     })
+}
+
+fn is_no_such_process(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(libc::ESRCH)
 }
 
 fn emit_client_event(app: &AppHandle, event: ClientEvent) {
@@ -794,5 +806,81 @@ mod tests {
         invalid.confirmed_device = "other".into();
         assert!(validate_request(&invalid).is_err());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn continuation_requires_opened_and_advances_the_same_protocol_before_writing() {
+        let mut protocol = GuidedProtocol::default();
+        let mut input = Vec::new();
+        assert!(send_continue_after_opened(&mut protocol, false, &mut input).is_err());
+        assert!(
+            input.is_empty(),
+            "no automatic CONTINUE before OPENED/user action"
+        );
+        assert_eq!(protocol.state(), crate::model::ScanState::OpeningScanner);
+
+        protocol.observe(ClientEvent::Opened).unwrap();
+        assert_eq!(
+            protocol.state(),
+            crate::model::ScanState::AwaitingHolderConfirmation
+        );
+        send_continue_after_opened(&mut protocol, true, &mut input).unwrap();
+        assert_eq!(input, b"CONTINUE\n");
+        assert_eq!(
+            protocol.state(),
+            crate::model::ScanState::WaitingForHolderDetection
+        );
+        protocol.observe(ClientEvent::HolderDetected).unwrap();
+        assert_eq!(protocol.state(), crate::model::ScanState::PositioningFrame);
+
+        assert!(send_continue_after_opened(&mut protocol, true, &mut input).is_err());
+        assert_eq!(
+            input, b"CONTINUE\n",
+            "duplicate clicks cannot send a second token"
+        );
+    }
+
+    #[test]
+    fn direct_child_termination_reaps_without_process_group_signals() {
+        let mut child = Command::new("/bin/sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("fixed harmless macOS sleep utility starts");
+        let result = terminate_and_reap(&mut child).unwrap();
+        assert!(!result.status.success());
+        assert!(
+            !result.forced_kill,
+            "SIGTERM should be sufficient for sleep"
+        );
+        assert_eq!(child.try_wait().unwrap(), Some(result.status));
+    }
+
+    #[test]
+    fn term_permission_errors_are_not_treated_as_reaped_or_cleaned() {
+        assert!(!is_no_such_process(&io::Error::from_raw_os_error(
+            libc::EPERM
+        )));
+        assert!(is_no_such_process(&io::Error::from_raw_os_error(
+            libc::ESRCH
+        )));
+    }
+
+    #[test]
+    fn tauri_event_payload_fields_use_frontend_camel_case_contract() {
+        let chunk = serde_json::to_value(GuidedUiEvent::DataChunk {
+            chunk_bytes: 7,
+            total_bytes: 19,
+        })
+        .unwrap();
+        assert_eq!(chunk["kind"], "dataChunk");
+        assert_eq!(chunk["chunkBytes"], 7);
+        assert_eq!(chunk["totalBytes"], 19);
+        assert!(chunk.get("chunk_bytes").is_none());
+
+        let exited = serde_json::to_value(GuidedUiEvent::ProcessExited { exit_code: 0 }).unwrap();
+        assert_eq!(exited["exitCode"], 0);
     }
 }

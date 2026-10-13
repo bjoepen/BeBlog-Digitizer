@@ -1,5 +1,5 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/svelte";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const eventState = vi.hoisted(() => ({ handler: undefined as undefined | ((event: { payload: unknown }) => void) }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async (_name: string, handler: (event: { payload: unknown }) => void) => { eventState.handler = handler; return () => {}; }) }));
@@ -9,6 +9,7 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn(async () => null) }));
 import App from "./App.svelte";
 
 describe("App", () => {
+  beforeEach(() => vi.clearAllMocks());
   afterEach(() => { cleanup(); eventState.handler = undefined; });
 
   it("shows single-frame controls but keeps real scanner start locked pending hash approval", () => {
@@ -38,6 +39,23 @@ describe("App", () => {
     eventState.handler!({ payload: { kind: "opened" } });
     expect(await screen.findByText(/Filmhalter jetzt einsetzen/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Filmhalter eingesetzt bestätigen" })).toBeInTheDocument();
+  });
+
+  it("does not send CONTINUE or log confirmation until the user presses the confirmation button", async () => {
+    const dialog = await import("@tauri-apps/plugin-dialog");
+    const tauri = await import("@tauri-apps/api/core");
+    vi.mocked(dialog.open).mockResolvedValueOnce("/Volumes/Scan SSD/Film");
+    render(App);
+    await fireEvent.click(screen.getByRole("button", { name: "Ordner auswählen …" }));
+    await fireEvent.click(screen.getByRole("button", { name: "Geführten Ablauf simulieren" }));
+    await waitFor(() => expect(eventState.handler).toBeDefined());
+    eventState.handler!({ payload: { kind: "opened" } });
+    await screen.findByRole("button", { name: "Filmhalter eingesetzt bestätigen" });
+    expect(vi.mocked(tauri.invoke)).not.toHaveBeenCalledWith("confirm_guided_holder");
+    expect(screen.queryByText("Benutzerbestätigung")).not.toBeInTheDocument();
+
+    await fireEvent.click(screen.getByRole("button", { name: "Filmhalter eingesetzt bestätigen" }));
+    await waitFor(() => expect(vi.mocked(tauri.invoke)).toHaveBeenCalledWith("confirm_guided_holder"));
   });
 
   it("allows choosing an external archive folder without starting a scan", async () => {
