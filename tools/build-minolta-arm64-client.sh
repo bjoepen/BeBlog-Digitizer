@@ -24,7 +24,7 @@ fail() {
 [[ -f "$VENDOR/minolta-batch-frame.original.c" ]] || fail "original source snapshot missing"
 ACTUAL_ORIGINAL_SHA256="$(/usr/bin/shasum -a 256 "$VENDOR/minolta-batch-frame.original.c" | /usr/bin/awk '{print $1}')"
 [[ "$ACTUAL_ORIGINAL_SHA256" == "$ORIGINAL_SHA256" ]] || fail "original source snapshot hash mismatch"
-[[ "$BUILD_DIR" == "$REPO_ROOT/src-tauri/target/minolta-hardware-test" || "$BUILD_DIR" == "$REPO_ROOT/src-tauri/target/minolta-d4-app-resource" || "$BUILD_DIR" == "$REPO_ROOT/src-tauri/sidecars/macos-aarch64" ]] || fail "build output directory is outside the explicitly allowed locations"
+[[ "$BUILD_DIR" == "$REPO_ROOT/src-tauri/target/minolta-hardware-test" || "$BUILD_DIR" == "$REPO_ROOT/src-tauri/target/minolta-d4-app-resource" || "$BUILD_DIR" == "$REPO_ROOT/src-tauri/target/minolta-d5-frame6-candidate" || "$BUILD_DIR" == "$REPO_ROOT/src-tauri/target/minolta-d5-frame6-candidate-revision-2" || "$BUILD_DIR" == "$REPO_ROOT/src-tauri/sidecars/macos-aarch64" ]] || fail "build output directory is outside the explicitly allowed locations"
 [[ -f "$SANE_INCLUDE/sane/sane.h" && -f "$SANE_INCLUDE/sane/saneopts.h" ]] || fail "SANE headers missing at $SANE_INCLUDE/sane"
 [[ -f "$SANE_LIBRARY" ]] || fail "SANE ARM64 library missing at $SANE_LIBRARY"
 [[ -f "$SANE_PC" ]] || fail "SANE pkg-config metadata missing at $SANE_PC"

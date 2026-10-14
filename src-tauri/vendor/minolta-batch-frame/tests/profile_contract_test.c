@@ -11,12 +11,18 @@ int main(void) {
         assert(!minolta_parse_supported_dpi(bad_values[index], &dpi));
 
     unsigned value = 0;
-    assert(minolta_parse_bounded_uint("1", 1, 4, &value) && value == 1U);
-    assert(minolta_parse_bounded_uint("4", 1, 4, &value) && value == 4U);
-    const char *bad_frames[] = {"", "0", "5", "-1", "+1", "1x", " 1", "1 ",
+    assert(minolta_parse_frame("1", &value) && value == 1U);
+    assert(minolta_parse_frame("6", &value) && value == 6U);
+    const char *bad_cli_frames[] = {"", "0", "7", "-1", "+1", "1x", " 1", "1 ",
+                                    "4294967296"};
+    for (unsigned index = 0; index < sizeof bad_cli_frames / sizeof bad_cli_frames[0]; ++index)
+        assert(!minolta_parse_frame(bad_cli_frames[index], &value));
+    assert(minolta_parse_bounded_uint("1", 1, 6, &value) && value == 1U);
+    assert(minolta_parse_bounded_uint("6", 1, 6, &value) && value == 6U);
+    const char *bad_frames[] = {"", "0", "7", "-1", "+1", "1x", " 1", "1 ",
                                 "4294967296", "999999999999999999999999999999"};
     for (unsigned index = 0; index < sizeof bad_frames / sizeof bad_frames[0]; ++index)
-        assert(!minolta_parse_bounded_uint(bad_frames[index], 1, 4, &value));
+        assert(!minolta_parse_bounded_uint(bad_frames[index], 1, 6, &value));
     assert(minolta_parse_bounded_uint("3600", 1, 3600, &value) && value == 3600U);
     assert(!minolta_parse_bounded_uint("3601", 1, 3600, &value));
     assert(minolta_parse_bounded_uint("60", 1, 60, &value) && value == 60U);

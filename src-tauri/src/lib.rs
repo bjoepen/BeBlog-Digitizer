@@ -10,6 +10,7 @@ mod log_parser;
 mod model;
 pub mod offline_import;
 mod process;
+mod scanner_discovery;
 mod sidecar;
 mod state_machine;
 
@@ -94,6 +95,18 @@ fn cancel_guided_scan(core: State<'_, AppCore>) -> Result<(), String> {
     core.cancel_guided_scan()
 }
 
+#[tauri::command]
+fn detect_minolta_scanners(
+    core: State<'_, AppCore>,
+) -> Result<scanner_discovery::DiscoveryResult, String> {
+    core.discover_minolta_scanners()
+}
+
+#[tauri::command]
+fn guided_scan_cooldown_remaining(core: State<'_, AppCore>) -> u64 {
+    core.guided_cooldown_remaining_seconds()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -123,7 +136,9 @@ pub fn run() {
             start_guided_scan,
             start_guided_simulation,
             confirm_guided_holder,
-            cancel_guided_scan
+            cancel_guided_scan,
+            detect_minolta_scanners,
+            guided_scan_cooldown_remaining
         ])
         .run(tauri::generate_context!())
         .expect("error while running BeBlog Digitizer");

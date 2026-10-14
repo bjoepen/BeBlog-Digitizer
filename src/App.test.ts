@@ -15,20 +15,49 @@ describe("App", () => {
   it("shows the explicitly hash-approved real scanner path while requiring device and output confirmation", async () => {
     render(App);
     expect(screen.getByRole("heading", { name: "BeBlog Digitizer" })).toBeInTheDocument();
-    expect(screen.getByLabelText("Frame")).toBeInTheDocument();
+    expect(screen.getByLabelText("Filmposition")).toBeInTheDocument();
     expect(screen.getByLabelText("Auflösung")).toBeInTheDocument();
     expect(screen.getByLabelText("Ausgabeordner")).toBeInTheDocument();
     expect(screen.getByText("RGB8")).toBeInTheDocument();
-    expect(screen.getByText(/Realer Hardwarelauf ist freigeschaltet, aber noch nicht hardwaregetestet/)).toBeInTheDocument();
+    expect(screen.getByText(/Hashgebundener Minolta-Client · Hardware nicht getestet/)).toBeInTheDocument();
     const start = screen.getByRole("button", { name: "Realen Einzelbildscan starten" });
     expect(start).toBeDisabled();
-    await fireEvent.input(screen.getByLabelText("Scanner-Gerätebezeichner"), { target: { value: "scanner:explicit" } });
-    await fireEvent.click(screen.getByRole("button", { name: "Gerät bestätigen" }));
+    const tauri = await import("@tauri-apps/api/core");
+    vi.mocked(tauri.invoke).mockResolvedValueOnce({
+      state: "oneScanner",
+      devices: [{ id: "avision:usb:001", displayName: "Minolta DiMAGE Scan Dual II", vendor: "Minolta", model: "DiMAGE Scan Dual II", deviceType: "film scanner" }],
+    });
+    await fireEvent.click(screen.getByRole("button", { name: "Scanner erkennen / erneut suchen" }));
+    expect(await screen.findByText("Ein Scanner gefunden. Bitte auswählen und ausdrücklich bestätigen.")).toBeInTheDocument();
+    await fireEvent.click(screen.getByRole("button", { name: "Scanner bestätigen" }));
     expect(start).toBeDisabled();
     const dialog = await import("@tauri-apps/plugin-dialog");
     vi.mocked(dialog.open).mockResolvedValueOnce("/Volumes/Scan SSD/Film");
     await fireEvent.click(screen.getByRole("button", { name: "Ordner auswählen …" }));
     expect(start).toBeEnabled();
+  });
+
+  it("runs scanner discovery only after an explicit click and presents no/one/multiple results", async () => {
+    const tauri = await import("@tauri-apps/api/core");
+    render(App);
+    expect(vi.mocked(tauri.invoke)).not.toHaveBeenCalledWith("detect_minolta_scanners");
+    vi.mocked(tauri.invoke).mockResolvedValueOnce({ state: "noScanner", devices: [] });
+    await fireEvent.click(screen.getByRole("button", { name: "Scanner erkennen / erneut suchen" }));
+    expect(await screen.findByText("Kein Minolta DiMAGE Scan Dual II gefunden.")).toBeInTheDocument();
+
+    vi.mocked(tauri.invoke).mockResolvedValueOnce({
+      state: "oneScanner",
+      devices: [{ id: "avision:usb:001", displayName: "Minolta DiMAGE Scan Dual II", vendor: "Minolta", model: "DiMAGE Scan Dual II", deviceType: "film scanner" }],
+    });
+    await fireEvent.click(screen.getByRole("button", { name: "Scanner erkennen / erneut suchen" }));
+    expect(await screen.findByText("Ein Scanner gefunden. Bitte auswählen und ausdrücklich bestätigen.")).toBeInTheDocument();
+
+    vi.mocked(tauri.invoke).mockResolvedValueOnce({
+      state: "multipleScanners",
+      devices: ["001", "002"].map((id) => ({ id: `avision:usb:${id}`, displayName: "Minolta DiMAGE Scan Dual II", vendor: "Minolta", model: "DiMAGE Scan Dual II", deviceType: "film scanner" })),
+    });
+    await fireEvent.click(screen.getByRole("button", { name: "Scanner erkennen / erneut suchen" }));
+    expect(await screen.findByText("2 passende Scanner gefunden. Bitte den gewünschten Scanner auswählen und bestätigen.")).toBeInTheDocument();
   });
 
   it("does not show a holder-insertion prompt before an OPENED event", () => {
@@ -83,6 +112,6 @@ describe("App", () => {
     await fireEvent.click(screen.getByRole("button", { name: "Ordner auswählen …" }));
     await fireEvent.click(screen.getByRole("button", { name: "Ablauf hardwarefrei simulieren" }));
     await waitFor(() => expect(tauri.invoke).toHaveBeenCalledWith("start_guided_simulation", { frame: 1, dpi: 2820, outputDirectory: "/Volumes/Scan SSD/Film" }));
-    expect(screen.getByText(/Realer Hardwarelauf ist freigeschaltet, aber noch nicht hardwaregetestet/)).toBeInTheDocument();
+    expect(screen.getByText(/Hashgebundener Minolta-Client · Hardware nicht getestet/)).toBeInTheDocument();
   });
 });

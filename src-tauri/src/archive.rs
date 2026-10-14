@@ -162,10 +162,8 @@ impl ArchiveManager {
         frame: u8,
         profile: crate::offline_import::ValidatedRgb8Profile,
     ) -> io::Result<PendingCapture> {
-        if !(1..=4).contains(&frame) {
-            return Err(invalid_data(
-                "Offline-Import unterstützt in D3-B3a nur Frames 1–4",
-            ));
+        if !(1..=6).contains(&frame) {
+            return Err(invalid_data("Offline-Import unterstützt Frames 1–6"));
         }
         let request = StartScanRequest {
             frame,

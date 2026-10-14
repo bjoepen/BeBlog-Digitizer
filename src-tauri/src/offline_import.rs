@@ -49,8 +49,8 @@ pub fn export_validated_artifacts(
     sources: &OfflineArtifactPaths,
     destination_root: &Path,
 ) -> io::Result<PathBuf> {
-    if !(1..=4).contains(&frame) {
-        return Err(invalid_data("Export akzeptiert ausschließlich Frames 1–4"));
+    if !(1..=6).contains(&frame) {
+        return Err(invalid_data("Export akzeptiert ausschließlich Frames 1–6"));
     }
     let raw = read_external_artifact(&sources.raw, MAX_RAW_BYTES)?;
     let tiff = read_external_artifact(&sources.tiff, MAX_TIFF_BYTES)?;
@@ -226,9 +226,9 @@ pub fn import_offline_artifacts(
     frame: u8,
     sources: &OfflineArtifactPaths,
 ) -> io::Result<OfflineImportReport> {
-    if !(1..=4).contains(&frame) {
+    if !(1..=6).contains(&frame) {
         return Err(invalid_data(
-            "D3-B3a-Profil akzeptiert ausschließlich Frames 1–4",
+            "Scanprofil akzeptiert ausschließlich Frames 1–6",
         ));
     }
     let (stage_dir, mut stage) = reserve_stage(archive.root_path())?;

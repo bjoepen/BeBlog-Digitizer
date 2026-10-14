@@ -6,6 +6,7 @@ use crate::{
         AppSnapshot, BatchSnapshot, EventLevel, HolderStatus, ScanError, ScanEvent, ScanState,
         SimulationMode, StartBatchRequest, StartScanRequest,
     },
+    scanner_discovery::{self, DiscoveryResult},
     state_machine::ScanStateMachine,
 };
 use serde::Serialize;
@@ -275,8 +276,8 @@ impl AppCore {
     }
 
     pub fn start(&self, app: AppHandle, request: StartScanRequest) -> Result<String, String> {
-        if !(1..=4).contains(&request.frame) {
-            return Err("Frame muss zwischen 1 und 4 liegen".into());
+        if !(1..=6).contains(&request.frame) {
+            return Err("Frame muss zwischen 1 und 6 liegen".into());
         }
         let id = format!("scan-{:06}", NEXT_JOB.fetch_add(1, Ordering::Relaxed));
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -308,6 +309,24 @@ impl AppCore {
         let job_id = id.clone();
         std::thread::spawn(move || core.run_job(app, job_id, request, cancelled, pending));
         Ok(id)
+    }
+
+    /// Performs discovery only when explicitly requested and holds the core
+    /// lock for the complete SANE enumeration, excluding all scan starts.
+    pub fn discover_minolta_scanners(&self) -> Result<DiscoveryResult, String> {
+        let data = self.data.lock().map_err(|_| "Interner Zustandsfehler")?;
+        ensure_idle(&data)?;
+        let cooldown = self.guided.cooldown_remaining_seconds();
+        if cooldown > 0 {
+            return Err(format!(
+                "Scannererkennung erst nach dem Cooldown in {cooldown} s"
+            ));
+        }
+        scanner_discovery::discover()
+    }
+
+    pub fn guided_cooldown_remaining_seconds(&self) -> u64 {
+        self.guided.cooldown_remaining_seconds()
     }
 
     pub fn cancel(&self, app: &AppHandle) -> Result<(), String> {

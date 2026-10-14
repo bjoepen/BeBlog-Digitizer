@@ -275,7 +275,7 @@ static bool raw_to_tiff(const char *raw_path, const char *tiff_path, const SANE_
 }
 
 static void usage(const char *argv0) {
-    fprintf(stderr, "Usage: %s -d DEVICE [-o PREFIX] [-f FRAME] [-r DPI (600|2820)] [-t SECONDS] [-i SECONDS]\n"
+    fprintf(stderr, "Usage: %s -d DEVICE [-o PREFIX] [-f FRAME (1..6)] [-r DPI (600|2820)] [-t SECONDS] [-i SECONDS]\n"
                     "Example: %s -d '<explicitly-confirmed-device>' -o frame1 -r 2820\n",
             argv0, argv0);
 }
@@ -292,8 +292,8 @@ int main(int argc, char **argv) {
             case 'd': device = optarg; break;
             case 'o': prefix = optarg; break;
             case 'f':
-                if (!minolta_parse_bounded_uint(optarg, 1U, 4U, &frame)) {
-                    fprintf(stderr, "Invalid frame '%s'; allowed values are 1 through 4\n", optarg);
+                if (!minolta_parse_frame(optarg, &frame)) {
+                    fprintf(stderr, "Invalid frame '%s'; allowed values are 1 through 6\n", optarg);
                     return 2;
                 }
                 break;
@@ -338,7 +338,7 @@ int main(int argc, char **argv) {
     diag("client start; device=%s requested_resolution_dpi=%u timeout=%u interval=%u SANE_DEBUG_AVISION=%s\n",
          device, resolution_dpi, timeout, interval, debug_level ? debug_level : "(unset)");
 
-    diag("batch mode: film holder remains inserted; requested frame=%u\n", frame);
+    diag("single-frame lifecycle: independent client process; requested frame=%u; holder checked after UI continuation\n", frame);
 
     SANE_Int version = 0;
     SANE_Status st = sane_init(&version, NULL);

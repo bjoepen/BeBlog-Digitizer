@@ -11,6 +11,12 @@
   let outputFolder = "";
   let device = "";
   let confirmedDevice = "";
+  let scanners: { id: string; displayName: string; vendor: string; model: string; deviceType: string }[] = [];
+  let discoveryState: "notChecked" | "searching" | "noScanner" | "oneScanner" | "multipleScanners" | "error" = "notChecked";
+  let discoveryMessage = "";
+  let cooldownRemaining = 0;
+  let sessionReleased = true;
+  let cooldownTimer: ReturnType<typeof setInterval> | undefined;
   let exportNotice = "";
   let simulationMode = false;
   let events: { label: string; detail: string; error?: boolean }[] = [];
@@ -28,11 +34,60 @@
     let unlisten: UnlistenFn | undefined;
     void listen<HardwareClientEvent>("hardware-client-event", ({ payload }) => {
       projection = projectHardwareEvent(projection, payload);
+      if (payload.kind === "scanCooldownStarted") startCooldownPolling(payload.seconds);
+      if (payload.kind === "sessionReleased") sessionReleased = true;
       events = [...events.slice(-99), { label: payload.kind === "holderConfirmationAccepted" ? "Benutzerbestätigung" : payload.kind, detail: payload.kind === "holderConfirmationAccepted" ? "Einsetzen durch Benutzer bestätigt; Haltererkennung folgt getrennt." : payload.kind === "dataChunk" ? `${payload.totalBytes.toLocaleString("de-DE")} Byte übertragen` : payload.kind === "error" || payload.kind === "openFailed" || payload.kind === "processFailed" ? payload.detail : payload.kind === "diagnostic" ? `[${payload.stream}] ${payload.message}` : payload.kind === "artifactsExported" ? payload.directory : payload.kind === "processExited" ? `OS-Exitcode ${payload.exitCode}` : payload.kind }];
       if (payload.kind === "artifactsExported") exportNotice = `Validierte Dateien exportiert: ${payload.directory}`;
     }).then((fn) => { if (disposed) fn(); else unlisten = fn; });
-    return () => { disposed = true; unlisten?.(); };
+    return () => { disposed = true; unlisten?.(); if (cooldownTimer) clearInterval(cooldownTimer); };
   });
+
+  async function refreshCooldown() {
+    try {
+      cooldownRemaining = Math.max(0, await invoke<number>("guided_scan_cooldown_remaining"));
+    } catch {
+      cooldownRemaining = Math.max(0, cooldownRemaining - 1);
+    }
+    if (cooldownRemaining === 0 && cooldownTimer) {
+      clearInterval(cooldownTimer);
+      cooldownTimer = undefined;
+    }
+  }
+
+  function startCooldownPolling(seconds: number) {
+    cooldownRemaining = seconds;
+    if (cooldownTimer) clearInterval(cooldownTimer);
+    void refreshCooldown();
+    cooldownTimer = setInterval(() => void refreshCooldown(), 1000);
+  }
+
+  async function detectScanners() {
+    discoveryState = "searching";
+    discoveryMessage = "Suche nach Minolta DiMAGE Scan Dual II …";
+    scanners = [];
+    device = "";
+    confirmedDevice = "";
+    try {
+      const result = await invoke<{ state: "noScanner" | "oneScanner" | "multipleScanners"; devices: typeof scanners }>("detect_minolta_scanners");
+      scanners = result.devices;
+      discoveryState = result.state;
+      if (result.state === "noScanner") discoveryMessage = "Kein Minolta DiMAGE Scan Dual II gefunden.";
+      else if (result.state === "oneScanner") {
+        discoveryMessage = "Ein Scanner gefunden. Bitte auswählen und ausdrücklich bestätigen.";
+        device = result.devices[0]?.id ?? "";
+      } else discoveryMessage = `${result.devices.length} passende Scanner gefunden. Bitte den gewünschten Scanner auswählen und bestätigen.`;
+    } catch (error) {
+      discoveryState = "error";
+      discoveryMessage = String(error);
+    }
+  }
+
+  function prepareNextScan() {
+    if (!sessionReleased) return;
+    projection = initialGuidedProjection;
+    exportNotice = "";
+    sessionReleased = true;
+  }
 
   async function confirmInserted() {
     const confirmedProjection = confirmHolderInsertion(projection);
@@ -45,12 +100,15 @@
   }
 
   async function startGuidedScan() {
+    if (frame > 4 || cooldownRemaining > 0 || !sessionReleased) return;
     simulationMode = false;
+    sessionReleased = false;
     projection = { ...initialGuidedProjection, state: "openingScanner" };
     try {
       await invoke<string>("start_guided_scan", { request: { frame, dpi, device, confirmedDevice, outputDirectory: outputFolder } });
       events = [...events, { label: "Prozessstart", detail: "Der kontrollierte Clientprozess wurde gestartet." }];
     } catch (error) {
+      sessionReleased = true;
       if (projection.state === "openingScanner") projection = { ...initialGuidedProjection, state: "failed", error: String(error) };
       events = [...events, { label: "Start gesperrt", detail: String(error), error: true }];
     }
@@ -58,12 +116,14 @@
 
   async function startGuidedSimulation() {
     simulationMode = true;
+    sessionReleased = false;
     exportNotice = "";
     projection = { ...initialGuidedProjection, state: "openingScanner" };
     try {
       await invoke<string>("start_guided_simulation", { frame, dpi, outputDirectory: outputFolder });
       events = [...events, { label: "Simulatorprozess", detail: "Harmloser BEBLOG/1-Kindprozess gestartet; keine Scanner- oder SANE-Zugriffe." }];
     } catch (error) {
+      sessionReleased = true;
       projection = { ...initialGuidedProjection, state: "failed", error: String(error) };
       events = [...events, { label: "Simulation fehlgeschlagen", detail: String(error), error: true }];
     }
@@ -99,14 +159,16 @@
       <div class="section-heading"><div><p class="step">EINZELBILDSCAN</p><h2>Scan vorbereiten</h2></div><span class="safe-note">RGB8 · keine automatische Wiederholung</span></div>
 
       <div class="control-grid">
-        <label>Frame<select bind:value={frame}>{#each [1,2,3,4] as value}<option value={value}>Frame {value}</option>{/each}</select></label>
+        <label>Filmposition<select bind:value={frame}>{#each [1,2,3,4,5,6] as value}<option value={value}>Frame {value}</option>{/each}</select></label>
         <label>Auflösung<select bind:value={dpi}><option value={2820}>2.820 dpi · Standard</option><option value={600}>600 dpi · Referenz</option></select></label>
         <div class="parameter"><span>Farbmodus</span><strong>RGB8</strong></div>
       </div>
 
       <div class="folder"><span>Ausgabeordner</span><div class="folder-row"><input aria-label="Ausgabeordner" type="text" readonly placeholder="Noch kein Ordner ausgewählt" bind:value={outputFolder} /><button class="secondary" on:click={chooseFolder}>Ordner auswählen …</button></div></div>
-      <div class="folder"><span>Scannergerät</span><div class="folder-row"><input aria-label="Scanner-Gerätebezeichner" type="text" placeholder="Gerätebezeichner in der App eingeben" bind:value={device} on:input={() => confirmedDevice = ""} /><button class="secondary" disabled={!device.trim()} on:click={() => confirmedDevice = device}>Gerät bestätigen</button></div><p class="hint">Der Gerätebezeichner wird nicht geraten oder automatisch aus alten USB-Adressen übernommen. Bestätige genau den hier eingetragenen Wert.</p>{#if confirmedDevice}<p class="safe-note" role="status">Bestätigt: {confirmedDevice}</p>{/if}</div>
-      <p class="hint">Der Zielordner kann auf einer externen SSD liegen. Vor Freigabe wird pro Aufnahme ein neuer, kollisionsfreier Unterordner verwendet.</p>
+      <div class="folder"><span>Scannererkennung</span><div class="folder-row"><button class="secondary" disabled={!sessionReleased || cooldownRemaining > 0 || discoveryState === "searching"} on:click={detectScanners}>{discoveryState === "searching" ? "Suche läuft …" : "Scanner erkennen / erneut suchen"}</button><select aria-label="Erkannten Scanner auswählen" bind:value={device} on:change={() => confirmedDevice = ""} disabled={!sessionReleased || scanners.length === 0 || cooldownRemaining > 0}><option value="">Scanner auswählen</option>{#each scanners as scanner}<option value={scanner.id}>{scanner.displayName}</option>{/each}</select><button class="secondary" disabled={!device || confirmedDevice === device || !sessionReleased} on:click={() => confirmedDevice = device}>Scanner bestätigen</button></div><p class="hint">Die Erkennung wird nur auf ausdrücklichen Klick und im Leerlauf ausgeführt. Sie öffnet keinen Scan und bewegt den Filmhalter nicht.</p>{#if discoveryMessage}<p role="status">{discoveryMessage}</p>{/if}{#if device}<details><summary>Diagnosedaten</summary><code>{device}</code></details>{/if}{#if confirmedDevice}<p class="safe-note" role="status">Auswahl bestätigt: {scanners.find((scanner) => scanner.id === confirmedDevice)?.displayName ?? confirmedDevice}</p>{/if}</div>
+      <p class="hint">Der Zielordner kann auf einer externen SSD liegen. Jeder manuelle Scan startet einen neuen Clientprozess und erhält einen eigenen kollisionsfreien Exportordner.</p>
+      {#if frame > 4}<p class="error-banner" role="status">Frames 5–6 sind im UI verfügbar, benötigen für reale Scans aber noch die separate Freigabe des neu gebauten Clienthashs. Die Simulation unterstützt beide Positionen.</p>{/if}
+      {#if cooldownRemaining > 0}<p class="safe-note" role="status">Nächster realer Scan frühestens in {cooldownRemaining} Sekunden. Der Cooldown wird im Rust-Core erzwungen.</p>{/if}
 
       <div class="holder-guide" aria-live="polite">
         <p><strong>1 · {simulationMode ? "Simulator vorbereiten." : "Scanner vorbereiten."}</strong> {simulationMode ? "Der Testprozess erzeugt ausschließlich synthetische Dateien." : "Filmhalter herausnehmen, Klappe schließen und Scanner einschalten."}</p>
@@ -123,8 +185,8 @@
 
       {#if projection.error}<p class="error-banner" role="alert">{projection.error}</p>{/if}
       {#if exportNotice}<p class="success-banner" role="status">{exportNotice}</p>{/if}
-      <div class="gate" role="status"><strong>Realer Hardwarelauf ist freigeschaltet, aber noch nicht hardwaregetestet.</strong><span>Der feste SHA-256-Vertrauensanker gilt ausschließlich für den geprüften ARM64-Client. Simulation und Hardwarelauf bleiben getrennte Aktionen.</span></div>
-      <div class="actions"><button class="primary" disabled={!clientApproved || !outputFolder.trim() || !device.trim() || confirmedDevice !== device || projection.state !== "idle"} on:click={startGuidedScan}>Realen Einzelbildscan starten</button><button class="secondary" disabled={!outputFolder.trim() || projection.state !== "idle"} on:click={startGuidedSimulation}>Ablauf hardwarefrei simulieren</button><button class="secondary" disabled={projection.state === "idle" || projection.state === "completed" || projection.state === "failed" || projection.state === "cancelled" || projection.state === "timedOut"} on:click={cancelGuidedScan}>Abbrechen</button></div>
+      <div class="gate" role="status"><strong>Hashgebundener Hardwarepfad · Einzelbildbetrieb.</strong><span>Erkennung, Auswahl, manuelle Halterbestätigung und erneuter Start sind getrennte Schritte. Keine automatischen Wiederholungen.</span></div>
+      <div class="actions"><button class="primary" disabled={!clientApproved || !outputFolder.trim() || !device.trim() || confirmedDevice !== device || projection.state !== "idle" || !sessionReleased || frame > 4 || cooldownRemaining > 0} on:click={startGuidedScan}>Realen Einzelbildscan starten</button><button class="secondary" disabled={!outputFolder.trim() || projection.state !== "idle" || !sessionReleased} on:click={startGuidedSimulation}>Ablauf hardwarefrei simulieren</button><button class="secondary" disabled={projection.state === "idle" || projection.state === "completed" || projection.state === "failed" || projection.state === "cancelled" || projection.state === "timedOut"} on:click={cancelGuidedScan}>Abbrechen</button>{#if ["completed", "failed", "cancelled", "timedOut"].includes(projection.state) && sessionReleased}<button class="secondary" on:click={prepareNextScan}>Nächsten Einzelbildscan vorbereiten</button>{/if}</div>
     </section>
 
     <aside class="card log-card"><div class="section-heading"><div><p class="step">DIAGNOSE</p><h2>Scannerereignisse</h2></div><span>{events.length}</span></div>

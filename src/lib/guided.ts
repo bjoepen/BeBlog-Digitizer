@@ -19,7 +19,9 @@ export type HardwareClientEvent =
   | { kind: "processCleaned" }
   | { kind: "processCancelled" }
   | { kind: "processTimedOut" }
-  | { kind: "processForcedKill" };
+  | { kind: "processForcedKill" }
+  | { kind: "scanCooldownStarted"; seconds: number }
+  | { kind: "sessionReleased" };
 
 export type GuidedState = "idle" | "openingScanner" | "awaitingHolderConfirmation" | "waitingForHolderDetection" | "positioningFrame" | "configuringFrame" | "scanning" | "transferring" | "finalizing" | "closingScanner" | "completed" | "cancelled" | "timedOut" | "failed";
 
@@ -56,6 +58,8 @@ export function projectHardwareEvent(current: GuidedProjection, event: HardwareC
     case "processExited":
     case "processCleaned":
     case "processForcedKill":
+    case "scanCooldownStarted":
+    case "sessionReleased":
       return current;
     case "processCancelled":
       return { ...current, state: "cancelled", error: null };

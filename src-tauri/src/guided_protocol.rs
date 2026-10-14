@@ -174,7 +174,9 @@ impl GuidedProtocol {
             {
                 self.state = ScanState::PositioningFrame
             }
-            ClientEvent::FramePositioned(_) if self.state == ScanState::PositioningFrame => {
+            ClientEvent::FramePositioned(frame)
+                if (1..=6).contains(&frame) && self.state == ScanState::PositioningFrame =>
+            {
                 self.state = ScanState::ConfiguringFrame
             }
             ClientEvent::Parameters {

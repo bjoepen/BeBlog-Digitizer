@@ -20,7 +20,7 @@ pub fn run_from_args(args: &[std::ffi::OsString]) -> Result<(), String> {
         .to_string_lossy()
         .parse::<u16>()
         .map_err(|_| "invalid dpi")?;
-    if !(1..=4).contains(&frame) || !matches!(dpi, 600 | 2820) {
+    if !(1..=6).contains(&frame) || !matches!(dpi, 600 | 2820) {
         return Err("unsupported synthetic profile".into());
     }
     let (width, height) = if dpi == 600 {

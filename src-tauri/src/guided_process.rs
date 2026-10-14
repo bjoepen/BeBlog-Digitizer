@@ -29,6 +29,7 @@ use tauri::{AppHandle, Emitter};
 
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const TERMINATION_GRACE: Duration = Duration::from_secs(15);
+const REAL_SCAN_COOLDOWN: Duration = Duration::from_secs(30);
 const HOLDER_TIMEOUT_SECONDS: u32 = 120;
 const HOLDER_POLL_SECONDS: u32 = 2;
 
@@ -91,6 +92,10 @@ enum GuidedUiEvent {
     ProcessCancelled,
     ProcessTimedOut,
     ProcessForcedKill,
+    ScanCooldownStarted {
+        seconds: u64,
+    },
+    SessionReleased,
     ArtifactsExported {
         directory: String,
         capture_id: String,
@@ -103,6 +108,7 @@ enum GuidedUiEvent {
 #[derive(Clone, Default)]
 pub(crate) struct GuidedProcessController {
     active: Arc<Mutex<Option<ActiveSession>>>,
+    cooldown_until: Arc<Mutex<Option<Instant>>>,
 }
 
 #[derive(Clone)]
@@ -132,6 +138,8 @@ impl GuidedProcessController {
         on_finished: impl FnOnce(bool) + Send + 'static,
     ) -> Result<String, String> {
         validate_request(&request)?;
+        ensure_approved_client_supports_frame(request.frame)?;
+        self.ensure_cooldown_elapsed()?;
         let client =
             resolve_approved_minolta_client(&resource_dir).map_err(|error| error.to_string())?;
         let work_directory =
@@ -146,6 +154,7 @@ impl GuidedProcessController {
             request,
             archive,
             cancelled,
+            true,
             on_finished,
         )
     }
@@ -186,6 +195,7 @@ impl GuidedProcessController {
             request,
             archive,
             cancelled,
+            false,
             on_finished,
         )
     }
@@ -200,6 +210,7 @@ impl GuidedProcessController {
         request: GuidedScanRequest,
         archive: ArchiveManager,
         cancelled: Arc<AtomicBool>,
+        real_scan: bool,
         on_finished: impl FnOnce(bool) + Send + 'static,
     ) -> Result<String, String> {
         let run_id = uuid::Uuid::new_v4().to_string();
@@ -223,6 +234,7 @@ impl GuidedProcessController {
             });
         }
         let active = self.active.clone();
+        let cooldown_until = self.cooldown_until.clone();
         let worker_run_id = run_id.clone();
         thread::spawn(move || {
             let result = run_client(
@@ -236,6 +248,18 @@ impl GuidedProcessController {
                 cancelled,
                 control_rx,
             );
+            if real_scan {
+                let until = Instant::now() + REAL_SCAN_COOLDOWN;
+                if let Ok(mut cooldown) = cooldown_until.lock() {
+                    *cooldown = Some(until);
+                }
+                emit(
+                    &app,
+                    GuidedUiEvent::ScanCooldownStarted {
+                        seconds: REAL_SCAN_COOLDOWN.as_secs(),
+                    },
+                );
+            }
             let succeeded = result.is_ok();
             if let Err(error) = result {
                 emit(&app, GuidedUiEvent::ProcessFailed { detail: error });
@@ -249,6 +273,7 @@ impl GuidedProcessController {
                     *active = None;
                 }
             }
+            emit(&app, GuidedUiEvent::SessionReleased);
         });
         Ok(run_id)
     }
@@ -283,11 +308,52 @@ impl GuidedProcessController {
         let _ = session.control.send(ControlMessage::Cancel);
         Ok(())
     }
+
+    pub(crate) fn cooldown_remaining_seconds(&self) -> u64 {
+        let Ok(cooldown) = self.cooldown_until.lock() else {
+            return REAL_SCAN_COOLDOWN.as_secs();
+        };
+        cooldown
+            .as_ref()
+            .map(|until| remaining_seconds(*until, Instant::now()))
+            .unwrap_or(0)
+    }
+
+    fn ensure_cooldown_elapsed(&self) -> Result<(), String> {
+        let remaining = self.cooldown_remaining_seconds();
+        if remaining > 0 {
+            Err(format!(
+                "Nächster realer Scan erst nach dem Sicherheitsabstand von 30 Sekunden (noch {remaining} s)"
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn remaining_seconds(until: Instant, now: Instant) -> u64 {
+    let remaining = until.saturating_duration_since(now);
+    remaining
+        .as_secs()
+        .saturating_add((remaining.subsec_nanos() > 0) as u64)
+}
+
+fn ensure_approved_client_supports_frame(frame: u8) -> Result<(), String> {
+    if !(1..=6).contains(&frame) {
+        return Err("D5 unterstützt nur Filmpositionen 1–6".into());
+    }
+    if frame > 4 {
+        return Err(
+            "Filmpositionen 5–6 benötigen den neu gebauten Client und dessen separate Hashfreigabe"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 fn validate_request(request: &GuidedScanRequest) -> Result<(), String> {
-    if !(1..=4).contains(&request.frame) {
-        return Err("D4 unterstützt zunächst nur Frames 1–4".into());
+    if !(1..=6).contains(&request.frame) {
+        return Err("D5 unterstützt Filmpositionen 1–6".into());
     }
     if !matches!(request.dpi, 600 | 2820) {
         return Err("Auflösung muss 600 oder 2.820 dpi sein".into());
@@ -806,6 +872,54 @@ mod tests {
         invalid.confirmed_device = "other".into();
         assert!(validate_request(&invalid).is_err());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn six_positions_are_valid_requests_but_five_and_six_remain_locked_to_the_unapproved_client() {
+        let root =
+            std::env::temp_dir().join(format!("guided-frame-range-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let mut candidate = GuidedScanRequest {
+            frame: 6,
+            dpi: 2820,
+            device: "scanner:explicit".into(),
+            confirmed_device: "scanner:explicit".into(),
+            output_directory: root.clone(),
+        };
+        assert!(validate_request(&candidate).is_ok());
+        assert!(ensure_approved_client_supports_frame(4).is_ok());
+        assert!(ensure_approved_client_supports_frame(5).is_err());
+        assert!(ensure_approved_client_supports_frame(6).is_err());
+        candidate.frame = 0;
+        assert!(validate_request(&candidate).is_err());
+        candidate.frame = 7;
+        assert!(validate_request(&candidate).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn real_scan_cooldown_counts_down_without_sleeping() {
+        let start = Instant::now();
+        let until = start + Duration::from_secs(30);
+        assert_eq!(remaining_seconds(until, start), 30);
+        assert_eq!(
+            remaining_seconds(until, start + Duration::from_secs(12)),
+            18
+        );
+        assert_eq!(remaining_seconds(until, start + Duration::from_secs(30)), 0);
+        assert_eq!(remaining_seconds(until, start + Duration::from_secs(31)), 0);
+    }
+
+    #[test]
+    fn real_scan_start_is_rejected_until_the_core_cooldown_expires() {
+        let controller = GuidedProcessController::default();
+        *controller.cooldown_until.lock().unwrap() = Some(Instant::now() + Duration::from_secs(30));
+        assert!(controller
+            .ensure_cooldown_elapsed()
+            .unwrap_err()
+            .contains("30 Sekunden"));
+        *controller.cooldown_until.lock().unwrap() = None;
+        assert!(controller.ensure_cooldown_elapsed().is_ok());
     }
 
     #[test]
