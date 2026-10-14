@@ -6,6 +6,7 @@
   import { confirmHolderInsertion, initialGuidedProjection, projectHardwareEvent, type HardwareClientEvent } from "./lib/guided";
 
   type D6BatchEvent = { batchId: string; phase: string; currentFrame: number | null; completedFrames: number; totalFrames: number; cooldownRemainingSeconds: number; awaitingHolderConfirmation: boolean; scannerLeaseRetained: boolean; message: string };
+  type ScanParameters = Extract<HardwareClientEvent, { kind: "parameters" }>;
 
   let projection = initialGuidedProjection;
   let frame = 1;
@@ -25,6 +26,24 @@
   let batchSize = 4;
   let d6Batch: D6BatchEvent | null = null;
   let d6BatchActive = false;
+  let latestParameters: ScanParameters | null = null;
+  let lastBatchLogKey = "";
+  let lastD6Frame: number | null = null;
+  $: inspectorCooldown = d6BatchActive ? (d6Batch?.cooldownRemainingSeconds ?? 0) : cooldownRemaining;
+  $: showLastBatchState = Boolean(d6Batch && !d6BatchActive && projection.state === "idle");
+  $: inspectorProcessState = d6Batch && (d6BatchActive || showLastBatchState)
+    ? (d6PhaseNames[d6Batch.phase] ?? d6Batch.phase)
+    : (stateNames[projection.state] ?? "Nicht verbunden");
+  $: inspectorStatus = d6Batch && showLastBatchState
+    ? (d6Batch.phase === "failed" ? "Fehler" : d6Batch.phase === "cancelled" ? "Abgebrochen" : "Abgeschlossen")
+    : (!sessionReleased || d6BatchActive ? "Aktiv" : "Bereit");
+  const d6PhaseNames: Record<string, string> = {
+    starting: "Prozess wird vorbereitet", awaitingHolderConfirmation: "Warte auf Halterbestätigung",
+    waitingForHolderDetection: "Warte auf Haltererkennung", scanning: "Scan läuft",
+    finalizing: "Artefakte werden geprüft", closingScanner: "Scannerverbindung wird geschlossen",
+    interFrameCooldown: "Bereitschaftspause", completed: "Batch abgeschlossen",
+    failed: "Batch fehlgeschlagen", cancelled: "Batch abgebrochen", cancelling: "Abbruch läuft"
+  };
   const clientApproved = true;
   const stateNames: Record<string, string> = {
     idle: "Bereit", openingScanner: "Scanner wird initialisiert", awaitingHolderConfirmation: "Verbindung bestätigt",
@@ -39,25 +58,40 @@
     let unlisten: UnlistenFn | undefined;
     void listen<HardwareClientEvent>("hardware-client-event", ({ payload }) => {
       projection = projectHardwareEvent(projection, payload);
+      if (payload.kind === "parameters") latestParameters = payload;
       if (payload.kind === "scanCooldownStarted") startCooldownPolling(payload.seconds);
       if (payload.kind === "sessionReleased" && !d6BatchActive) sessionReleased = true;
-      events = [...events.slice(-99), { label: payload.kind === "holderConfirmationAccepted" ? "Benutzerbestätigung" : payload.kind, detail: payload.kind === "holderConfirmationAccepted" ? "Einsetzen durch Benutzer bestätigt; Haltererkennung folgt getrennt." : payload.kind === "dataChunk" ? `${payload.totalBytes.toLocaleString("de-DE")} Byte übertragen` : payload.kind === "error" || payload.kind === "openFailed" || payload.kind === "processFailed" ? payload.detail : payload.kind === "diagnostic" ? `[${payload.stream}] ${payload.message}` : payload.kind === "artifactsExported" ? payload.directory : payload.kind === "processExited" ? `OS-Exitcode ${payload.exitCode}` : payload.kind }];
+      if (payload.kind !== "dataChunk") {
+        appendEvent(
+          payload.kind === "holderConfirmationAccepted" ? "Benutzerbestätigung" : payload.kind,
+          payload.kind === "holderConfirmationAccepted" ? "Einsetzen durch Benutzer bestätigt; Haltererkennung folgt getrennt." : payload.kind === "error" || payload.kind === "openFailed" || payload.kind === "processFailed" ? payload.detail : payload.kind === "diagnostic" ? `[${payload.stream}] ${payload.message}` : payload.kind === "artifactsExported" ? payload.directory : payload.kind === "processExited" ? `OS-Exitcode ${payload.exitCode}` : payload.kind
+        );
+      }
       if (payload.kind === "artifactsExported") exportNotice = `Validierte Dateien exportiert: ${payload.directory}`;
     }).then((fn) => { if (disposed) fn(); else unlisten = fn; });
     let unlistenBatch: UnlistenFn | undefined;
     void listen<D6BatchEvent>("d6-batch-event", ({ payload }) => {
+      if (payload.currentFrame !== null && payload.currentFrame !== lastD6Frame) {
+        lastD6Frame = payload.currentFrame;
+        projection = { ...projection, transferredBytes: 0, expectedBytes: null, holderDetected: false };
+        latestParameters = null;
+      }
       d6Batch = payload;
       const terminal = ["completed", "failed", "cancelled"].includes(payload.phase);
       d6BatchActive = !terminal || payload.scannerLeaseRetained;
       if (terminal && !payload.scannerLeaseRetained) sessionReleased = true;
-      events = [...events.slice(-99), {
-        label: `D6 ${payload.phase} · Frame ${payload.currentFrame ?? "—"}/${payload.totalFrames}`,
-        detail: payload.message,
-        error: payload.phase === "failed"
-      }];
+      const logKey = `${payload.batchId}:${payload.phase}:${payload.currentFrame ?? "-"}`;
+      if (logKey !== lastBatchLogKey) {
+        lastBatchLogKey = logKey;
+        appendEvent(`D6 ${payload.phase} · Frame ${payload.currentFrame ?? "—"}/${payload.totalFrames}`, payload.message, payload.phase === "failed");
+      }
     }).then((fn) => { if (disposed) fn(); else unlistenBatch = fn; });
     return () => { disposed = true; unlisten?.(); unlistenBatch?.(); if (cooldownTimer) clearInterval(cooldownTimer); };
   });
+
+  function appendEvent(label: string, detail: string, error = false) {
+    events = [...events.slice(-99), { label, detail, error }];
+  }
 
   async function refreshCooldown() {
     try {
@@ -200,15 +234,9 @@
 
 <main>
   <header>
-    <div><p class="eyebrow">BeBlog · Filmwerkstatt</p><h1>BeBlog Digitizer</h1><p class="subtitle">Geführter Einzelbild-Workflow für den Minolta DiMAGE Scan Dual II.</p></div>
-    <div class="adapter-badge"><span></span>Hashgebundener Minolta-Client · Hardware nicht getestet</div>
+    <div><p class="eyebrow">BeBlog · Filmwerkstatt</p><h1>BeBlog Digitizer</h1><p class="subtitle">Geführte Einzelbild- und Batchscans für den Minolta DiMAGE Scan Dual II.</p></div>
+    <div class="adapter-badge"><span></span>Minolta ARM64 · D6-Vierer-Batch bestätigt</div>
   </header>
-
-  <section class="status-strip" aria-label="Scannerstatus">
-    <div><span>Scanner</span><strong>{stateNames[projection.state] ?? "Nicht verbunden"}</strong></div>
-    <div><span>Filmhalter</span><strong>{projection.holderDetected ? (simulationMode ? "Im Simulator erkannt" : "Vom Scanner erkannt") : "Noch nicht erkannt"}</strong></div>
-    <div><span>Übertragung</span><strong>{projection.expectedBytes === null ? "—" : `${projection.transferredBytes.toLocaleString("de-DE")} / ${projection.expectedBytes.toLocaleString("de-DE")} Byte`}</strong></div>
-  </section>
 
   <div class="workspace">
     <section class="card capture">
@@ -262,10 +290,36 @@
       <div class="actions"><button class="primary" disabled={d6BatchActive || !clientApproved || !outputFolder.trim() || !device.trim() || confirmedDevice !== device || projection.state !== "idle" || !sessionReleased || cooldownRemaining > 0} on:click={startGuidedScan}>Realen Einzelbildscan starten</button><button class="secondary" disabled={d6BatchActive || !outputFolder.trim() || projection.state !== "idle" || !sessionReleased} on:click={startGuidedSimulation}>Ablauf hardwarefrei simulieren</button><button class="secondary" disabled={d6BatchActive || projection.state === "idle" || projection.state === "completed" || projection.state === "failed" || projection.state === "cancelled" || projection.state === "timedOut"} on:click={cancelGuidedScan}>Einzelbildscan abbrechen</button>{#if d6BatchActive}<button class="secondary" on:click={cancelD6Batch}>D6-Batch abbrechen</button>{/if}{#if ["completed", "failed", "cancelled", "timedOut"].includes(projection.state) && sessionReleased && !d6BatchActive}<button class="secondary" on:click={prepareNextScan}>Nächsten Einzelbildscan vorbereiten</button>{/if}</div>
     </section>
 
-    <aside class="card log-card"><div class="section-heading"><div><p class="step">DIAGNOSE</p><h2>Scannerereignisse</h2></div><span>{events.length}</span></div>
-      <div class="log" aria-live="polite">{#if events.length === 0}<p class="empty">Noch keine Scannerereignisse. Benutzerbestätigung und Hardwareerkennung werden getrennt behandelt.</p>{:else}{#each [...events].reverse() as event}<article class:event-error={event.error}><strong>{event.label}</strong><p>{event.detail}</p></article>{/each}{/if}</div>
+    <aside class="card inspector" aria-label="Scanner-Inspector">
+      <div class="inspector-heading"><div><p class="step">LIVE-INSPECTOR</p><h2>Scannerstatus</h2></div><span class:busy={!sessionReleased || d6BatchActive || (showLastBatchState && d6Batch?.phase !== "completed")} class="status-pill">{inspectorStatus}</span></div>
+      <dl class="inspector-grid">
+        <div><dt>Prozesszustand</dt><dd>{inspectorProcessState}</dd></div>
+        <div><dt>Scanner</dt><dd class="wrap-value">{confirmedDevice ? (scanners.find((scanner) => scanner.id === confirmedDevice)?.displayName ?? confirmedDevice) : device || "Nicht ausgewählt"}</dd></div>
+        <div><dt>Filmhalter</dt><dd>{projection.holderDetected ? (simulationMode ? "Im Simulator erkannt" : "Vom Scanner erkannt") : "Noch nicht erkannt"}</dd></div>
+        <div><dt>Frame</dt><dd>{d6Batch && (d6BatchActive || showLastBatchState) && d6Batch.currentFrame ? `Frame ${d6Batch.currentFrame} von ${d6Batch.totalFrames}` : `Frame ${frame} · Einzelscan`}</dd></div>
+        <div><dt>{latestParameters ? "Zurückgelesenes Scanprofil" : "Gewähltes Scanprofil"}</dt><dd>{latestParameters ? `${latestParameters.dpi.toLocaleString("de-DE")} dpi · ${latestParameters.format}${latestParameters.depth} · ${latestParameters.width} × ${latestParameters.height}` : `${dpi.toLocaleString("de-DE")} dpi · RGB8`}</dd></div>
+      </dl>
+
+      <section class="transfer-panel" aria-label="Übertragungsfortschritt">
+        <div class="transfer-heading"><strong>RAW-Datenübertragung</strong><span>{projection.expectedBytes === null ? "Warte auf Parameter" : `${projection.transferredBytes.toLocaleString("de-DE")} / ${projection.expectedBytes.toLocaleString("de-DE")} Bytes`}</span></div>
+        {#if projection.expectedBytes !== null}
+          <progress aria-label="Fortschritt des aktuellen Frames" max={projection.expectedBytes} value={projection.transferredBytes}></progress>
+          <small>{Math.min(100, Math.round((projection.transferredBytes / projection.expectedBytes) * 100))}% · tatsächlicher Clientfortschritt</small>
+        {:else}
+          <div class="progress-placeholder">Noch keine Scanparameter empfangen</div>
+        {/if}
+      </section>
+
+      {#if inspectorCooldown > 0}
+        <div class="cooldown-status" role="status"><span>Bereitschaftspause</span><strong>{inspectorCooldown} s</strong></div>
+      {/if}
+      {#if projection.error}<p class="error-banner" role="alert">{projection.error}</p>{/if}
+      {#if d6Batch?.scannerLeaseRetained}<p class="error-banner" role="alert">Cleanup ungeklärt; Scanner bleibt gesperrt.</p>{/if}
+      {#if exportNotice}<p class="success-banner" role="status">{exportNotice}</p>{/if}
+
+      <div class="section-heading event-heading"><div><p class="step">DIAGNOSE</p><h3>Scannerereignisse</h3></div><span>{events.length}</span></div>
+      <div class="log" aria-label="Ereignisprotokoll" aria-live="polite">{#if events.length === 0}<p class="empty">Noch keine Scannerereignisse. Benutzerbestätigung und Hardwareerkennung werden getrennt behandelt.</p>{:else}{#each [...events].reverse() as event}<article class:event-error={event.error}><strong>{event.label}</strong><p>{event.detail}</p></article>{/each}{/if}</div>
     </aside>
   </div>
 
-  <section class="future-grid"><article class="placeholder"><p class="step">SCANARCHIV</p><h3>Originale bewahren</h3><p>RAW, TIFF, Parameter und Clientlog werden erst nach unabhängiger Validierung übernommen.</p><span>Validierung erforderlich</span></article><article class="placeholder"><p class="step">BILDENTWICKLUNG</p><h3>Separat entwickeln</h3><p>Farbkorrektur und Derivate bleiben vom Scanprozess getrennt.</p><span>Getrennte Verarbeitung</span></article></section>
 </main>
