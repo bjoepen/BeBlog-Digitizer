@@ -19,7 +19,7 @@ describe("App", () => {
     expect(screen.getByLabelText("Auflösung")).toBeInTheDocument();
     expect(screen.getByLabelText("Ausgabeordner")).toBeInTheDocument();
     expect(screen.getByText("RGB8")).toBeInTheDocument();
-    expect(screen.getByText(/Hashgebundener Minolta-Client · Hardware nicht getestet/)).toBeInTheDocument();
+    expect(screen.getByText(/Minolta ARM64 · D6-Vierer-Batch bestätigt/)).toBeInTheDocument();
     const start = screen.getByRole("button", { name: "Realen Einzelbildscan starten" });
     expect(start).toBeDisabled();
     const tauri = await import("@tauri-apps/api/core");
@@ -141,6 +141,66 @@ describe("App", () => {
     await fireEvent.click(screen.getByRole("button", { name: "Ordner auswählen …" }));
     await fireEvent.click(screen.getByRole("button", { name: "Ablauf hardwarefrei simulieren" }));
     await waitFor(() => expect(tauri.invoke).toHaveBeenCalledWith("start_guided_simulation", { frame: 1, dpi: 2820, outputDirectory: "/Volumes/Scan SSD/Film" }));
-    expect(screen.getByText(/Hashgebundener Minolta-Client · Hardware nicht getestet/)).toBeInTheDocument();
+    expect(screen.getByText(/Minolta ARM64 · D6-Vierer-Batch bestätigt/)).toBeInTheDocument();
+  });
+
+  it("keeps the inspector byte counter tied to actual process events", async () => {
+    const dialog = await import("@tauri-apps/plugin-dialog");
+    vi.mocked(dialog.open).mockResolvedValueOnce("/Volumes/Scan SSD/Film");
+    render(App);
+    await fireEvent.click(screen.getByRole("button", { name: "Ordner auswählen …" }));
+    await fireEvent.click(screen.getByRole("button", { name: "Ablauf hardwarefrei simulieren" }));
+    await waitFor(() => expect(eventState.handlers["hardware-client-event"]).toBeDefined());
+
+    const send = (payload: unknown) => eventState.handlers["hardware-client-event"]({ payload });
+    send({ kind: "opened" });
+    send({ kind: "holderConfirmationAccepted" });
+    send({ kind: "holderDetected" });
+    send({ kind: "framePositioned", frame: 1 });
+    send({ kind: "parameters", dpi: 600, width: 10, height: 10, bytesPerLine: 30, depth: 8, format: "RGB", expectedBytes: 100 });
+    send({ kind: "scanStarted" });
+    await waitFor(() => expect(screen.getByLabelText("Ereignisprotokoll").querySelectorAll("article")).toHaveLength(7));
+    const eventCountBeforeByteChunk = screen.getByLabelText("Ereignisprotokoll").querySelectorAll("article").length;
+    send({ kind: "dataChunk", chunkBytes: 10, totalBytes: 10 });
+
+    expect(await screen.findByText("10 / 100 Bytes")).toBeInTheDocument();
+    expect(screen.getByLabelText("Fortschritt des aktuellen Frames")).toHaveAttribute("value", "10");
+    expect(screen.getByText("600 dpi · RGB8 · 10 × 10")).toBeInTheDocument();
+    expect(screen.getByLabelText("Ereignisprotokoll").querySelectorAll("article")).toHaveLength(eventCountBeforeByteChunk);
+  });
+
+  it("keeps D6 cooldown as one live status instead of adding one event row per tick", async () => {
+    render(App);
+    await waitFor(() => expect(eventState.handlers["d6-batch-event"]).toBeDefined());
+    for (let seconds = 30; seconds >= 1; seconds -= 1) {
+      eventState.handlers["d6-batch-event"]({ payload: {
+        batchId: "d6-batch-test", phase: "interFrameCooldown", currentFrame: 1,
+        completedFrames: 1, totalFrames: 4, cooldownRemainingSeconds: seconds,
+        awaitingHolderConfirmation: false, scannerLeaseRetained: false,
+        message: `Bereitschaftspause: ${seconds} Sekunden`
+      } });
+    }
+    expect(await screen.findByText("1 s")).toBeInTheDocument();
+    expect(screen.getByLabelText("Ereignisprotokoll").querySelectorAll("article")).toHaveLength(1);
+    eventState.handlers["d6-batch-event"]({ payload: {
+      batchId: "d6-batch-test", phase: "failed", currentFrame: 2,
+      completedFrames: 1, totalFrames: 4, cooldownRemainingSeconds: 0,
+      awaitingHolderConfirmation: false, scannerLeaseRetained: false,
+      message: "Frame 2 konnte nicht validiert werden"
+    } });
+    expect(await screen.findByText("Batch fehlgeschlagen")).toBeInTheDocument();
+    expect(screen.getByText("Fehler")).toBeInTheDocument();
+    expect(screen.getAllByText("Frame 2 konnte nicht validiert werden")).toHaveLength(2);
+  });
+
+  it("offers the D6 batch sizes 2–6 with four selected by default", () => {
+    render(App);
+    const count = screen.getByLabelText("Anzahl Bilder");
+    expect(count).toHaveValue("4");
+    expect(Array.from((count as HTMLSelectElement).options).map((option) => option.value)).toEqual(["2", "3", "4", "5", "6"]);
+    expect(screen.getByRole("button", { name: "Batch mit 4 Bildern starten" })).toBeDisabled();
+    expect(screen.getByLabelText("Scanner-Inspector")).toBeInTheDocument();
+    expect(screen.queryByText("Originale bewahren")).not.toBeInTheDocument();
+    expect(screen.queryByText("Separat entwickeln")).not.toBeInTheDocument();
   });
 });
