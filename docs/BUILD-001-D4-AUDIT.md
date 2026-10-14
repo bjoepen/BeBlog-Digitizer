@@ -2,7 +2,7 @@
 
 **Basis:** D3-B5c `c73c9c7fb1ce0905944e83b75247a7aa6cfb0be1`
 **Branch:** `build/001-d4-guided-hardware-workflow`
-**Status:** guided process/UI/artifact integration implemented, hardware-free tested, and in the native ARM64 app visually exercised through validated export. Real client start remains deliberately blocked pending independent hash approval.
+**Status:** guided process/UI/artifact integration implemented and hardware-free tested. D4-HW2 explicitly approved the exact Minolta client SHA-256 for the real GUI start path. This is software authorization only; no real scanner test has been run. `CaptureKind::Production` remains locked.
 
 ## D4a – Korrektur nach nativem GUI-Test
 
@@ -15,7 +15,7 @@
 ## Ausgangsaudit
 
 - **PROVEN:** `AppCore::new()` aktiviert ausschließlich `FakeScannerAdapter`; die Tauri-Kommandos registrieren keinen Minolta-Start. Der normale UI-Pfad war ein Vierer-Batch-Simulator.
-- **PROVEN:** Der D2-`OsProcessRunner` bleibt test-only. D4 ergänzt einen separaten, fest verdrahteten Prozesscontroller für den Minolta-Ressourcenpfad; die Resolverfunktion verweigert den realen Start weiterhin, solange kein unabhängiger Hash freigegeben ist.
+- **PROVEN:** Der D2-`OsProcessRunner` bleibt test-only. D4 ergänzt einen separaten, fest verdrahteten Prozesscontroller für den Minolta-Ressourcenpfad; D4-HW2 pinnt den ausdrücklich freigegebenen Kandidatenhash im Quellcode und öffnet die GUI-Startsteuerung.
 - **PROVEN:** `OfflineArtifactImporter` prüft RAW, TIFF, Parameter und Clientlog und archiviert als `OfflineImport`; ein erfolgreicher Prozessnachweis und die Produktionsfinalisierung sind nicht über eine App-API verbunden.
 - **PROVEN:** Der C-Client führt `sane_init → sane_open → Halterpolling → Frame/Mode/DPI → sane_get_parameters → sane_start → sane_read bis EOF → Dateien → sane_close → sane_exit` aus. Vor dieser Änderung begann das Halterpolling unmittelbar nach `sane_open`; es gab kein UI-Fortsetzungsbarriere.
 - **PROVEN:** Frames sind auf 1–4 begrenzt, DPI auf 600/2820 und RGB8-Parameter/RAW-Größe werden aus den von SANE gelieferten Parametern geprüft. Der 2.820-dpi-Modus ist weiterhin nicht hardwarebestätigt.
@@ -33,7 +33,7 @@
 - Nach Prozessende muss BEBLOG/1 `COMPLETE` erreicht sein und der OS-Exitcode 0 sein. Danach prüft der vorhandene Importer alle vier Dateien; RAW/TIFF-Pixel müssen identisch sein. Validierte Dateien werden in ein neues, kollisionsfreies Unterverzeichnis des in der UI gewählten Ziels kopiert; Originaldateien werden nie überschrieben. Die UI meldet erst nach Export Erfolg.
 - Die Oberfläche bietet Gerätebezeichner-Eingabe plus exakte Bestätigung vollständig in der App; sie fragt SANE-Geräte nicht ab und übernimmt keine alten USB-Adressen. Frame und DPI sind typisiert/begrenzt.
 - Ein expliziter geführter Simulator startet eine zweite Instanz desselben App-Executables in einem isolierten `--beblog-guided-simulator`-Modus. Er schreibt ausschließlich synthetische Daten, spricht BEBLOG/1 und wartet auf `CONTINUE`. Der Capture wird `OfflineImport`, niemals `Production`, klassifiziert.
-- **Gesperrt (beabsichtigt):** `resolve_approved_minolta_client()` liefert aktuell `PermissionDenied`, weil `APPROVED_MINOLTA_CLIENT_SHA256` weiterhin `None` ist; die UI hat `clientApproved = false`. Der neue Client ist als App-Ressource paketiert, aber nicht über die Anwendung ausführbar. `CaptureKind::Production` bleibt ebenfalls gesperrt; reale SANE-Cleanup-Garantien werden nicht aus Logmarkern abgeleitet.
+- **Freigabestatus nach D4-HW2:** `resolve_approved_minolta_client()` akzeptiert ausschließlich SHA-256 `9049bb63b6a6a81ef1d686172f063d3949939e3acca7786fc3a414cb21d36aa6`; die UI öffnet den Einzelbildstart nur mit Ausgabeordner und manuell bestätigter Gerätekennung. Das ist keine Hardwareabnahme. `CaptureKind::Production` bleibt gesperrt; reale SANE-Cleanup-Garantien werden nicht aus Logmarkern abgeleitet.
 
 ## ARM64-Clientnachweis
 
@@ -43,7 +43,7 @@ Die angepasste Arbeitskopie wurde mit Apple Clang/SDK und ausschließlich lesend
 - Neue Arbeitskopie enthält gegenüber D3-B5c den synchronen OPENED/CONTINUE-Handshake und typisierte Ereignisausgaben.
 - Im finalen D4-Arbeitsstand eingebundener thin-ARM64-Binary-SHA-256 nach ad-hoc-Signierung: `9049bb63b6a6a81ef1d686172f063d3949939e3acca7786fc3a414cb21d36aa6`. Der feste Codesign-Identifier lautet `minolta-batch-frame`; der Linker erzeugt weiterhin pro Build eine Mach-O-UUID, daher ist der Hash als konkrete Kandidatenidentität zu verstehen, nicht als allgemein reproduzierbarer Source-Hash.
 - `file`, `lipo -archs`, `codesign --verify --strict` und `otool -L` bestätigten thin ARM64, gültige lokale Ad-hoc-Signatur und die bestehenden SANE-/libSystem-Referenzen.
-- **Nicht freigegeben:** Dieser Hash ist nur Buildidentität. Er wurde weder in `tools/minolta-hardware-test.sha256` geschrieben noch als vertrauenswürdig festgelegt. Der Tauri-Core vertraut ihm nicht.
+- **Softwarefreigabe D4-HW2:** Dieser exakte Hash ist der einzige vom Tauri-Resolver akzeptierte Minolta-Client. Er wurde nicht in `tools/minolta-hardware-test.sha256` geschrieben; dieser manuelle Launcher-Pin bleibt unabhängig und unangetastet.
 - Die bereits vorhandene ungetrackte `tools/minolta-hardware-test.sha256` wurde nicht geändert, gestaged oder committed.
 
 ## Hardwarefreie Regressionen
@@ -55,7 +55,8 @@ Die angepasste Arbeitskopie wurde mit Apple Clang/SDK und ausschließlich lesend
 - Erst HOLDER_DETECTED nach CONTINUE setzt den Halterstatus.
 - Simulierter Einzelbildablauf einschließlich Parameter, kumulierter Chunks, EOF, TIFF und Scannerabschluss.
 - Ungültige Reihenfolge, inkonsistente Bytezahlen und Fehlerereignisse werden abgewiesen.
-- Frontendtests prüfen sichtbare Start-Sperre, fehlende vorzeitige Halteraufforderung, Gerätebestätigung und UI-Eventprojektion.
+- Frontendtests prüfen den hashgebundenen Freigabestatus, erforderliche Geräte-/Zielbestätigung, fehlende vorzeitige Halteraufforderung und UI-Eventprojektion.
+- Resolvertests akzeptieren das exakt gepinnte Minolta-Binary und weisen eine nachträglich veränderte Kopie ab; Prozessprotokolltests weisen `CONTINUE` vor `OPENED` oder ohne tatsächliche Bestätigungsaktion ab.
 - `tests/guided_process_e2e.rs` startet das ARM64-App-Executable als echten Kindprozess im ausschließlich synthetischen Simulatormodus, liest OPENED, sendet CONTINUE, empfängt die Ereignisfolge bis COMPLETE, importiert/validiert die vier Dateien, archiviert als OfflineImport und exportiert alle Dateien in ein neues Zielverzeichnis.
 
 ## Prüfstatus
@@ -75,9 +76,18 @@ Aktuelle hardwarefreie Prüfmatrix:
 
 ## Offene Punkte / Freigabegates
 
-- **BLOCKER für reale Hardwareausführung:** unabhängige Freigabe des exakten Clienthashs `9049…44c6`. Keine automatische Hashübernahme ist implementiert.
+- **Software-Hashgate:** Für genau dieses Binary durch D4-HW2 freigegeben; abweichende Binary-Hashes werden abgewiesen. Es gibt keine automatische Hashübernahme.
 - **OPEN:** Geräteauswahl ist manuelle Gerätekennung plus exakte App-Bestätigung; automatische SANE-Geräteentdeckung wurde bewusst nicht hinzugefügt.
 - **OPEN:** erfolgreiche reale Scans werden aktuell konservativ als `OfflineImport` archiviert; `Production` bleibt gesperrt, bis OS-Prozessnachweis, reale Artefakte und SANE-Cleanup-Vertrag gemeinsam geprüft sind.
 - **OPEN:** 2.820-dpi-Geometrie/Artefakte sind weiterhin nicht hardwarebestätigt.
 
 Kein Minolta-Client, keine Scannerhardware, keine SANE-Kommandos und keine Geräteerkennung wurden ausgeführt. Nur der harmlose App-Simulator-Kindprozess lief im automatisierten Test. `/opt/homebrew` wurde ausschließlich lesend für Header/Library und ARM64-Linkreferenzen genutzt; SANE/avision, Research-009 und die ungetrackte Hash-Pindatei blieben unverändert.
+
+## D4-HW2 – Softwarefreigabe (hardwarefrei)
+
+- Fester Resolver-Trust-Anchor: `9049bb63b6a6a81ef1d686172f063d3949939e3acca7786fc3a414cb21d36aa6`. Der Resolver behält den festen App-Ressourcenpfad, ARM64-/Signaturprüfung und Hashvergleich bei; keine Laufzeit-Hashübernahme.
+- Die GUI unterscheidet nun ausdrücklich „Realen Einzelbildscan starten“ von „Ablauf hardwarefrei simulieren“. Realstart verlangt weiterhin Gerät + exakte Bestätigung, Ausgabeordner und Idle-Zustand. Die Filmhalteraufforderung erscheint erst nach `OPENED`; `CONTINUE` erfordert den manuellen Bestätigungsklick.
+- Hardwarefreie Regressionen: freigegebenes Testbinary akzeptiert, veränderte Kopie abgewiesen; vorhandene Tests sichern weiterhin den manuellen `CONTINUE`-Handshake. `CaptureKind::Production` bleibt gesperrt.
+- D4-HW2-Prüfmatrix: Rust 109 bestanden / 0 fehlgeschlagen / 12 bewusst ignorierte Child-Modi; Prozess-E2E 1/1; Frontend 15/15; TypeScript, Rust-Format, Clippy `-D warnings`, Vite-Build, nativer ARM64-Tauri-App-Build und `git diff --check` PASS.
+- Im neu erzeugten `.app` wurde das enthaltene Clientbinary erneut geprüft: SHA-256 stimmt mit dem Trust-Anchor überein, thin `arm64`, Codesign `adhoc`, `codesign --verify --strict` PASS. Das Binary wurde nicht ausgeführt.
+- Es erfolgten keine Scannerstarts, SANE-Geräteabfragen oder Hardwaretests. Die ungetrackte `tools/minolta-hardware-test.sha256` wurde nicht geändert oder committet.

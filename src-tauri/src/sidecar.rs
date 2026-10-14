@@ -1,7 +1,7 @@
 //! Resolve and verify fixed ARM64 sidecar resources.
 //!
-//! Minolta client resolution remains denied until an independent SHA-256
-//! approval is set in source. The harmless app-self simulator is separate.
+//! Minolta client resolution is restricted to the explicitly approved binary
+//! digest. The harmless app-self simulator is separate.
 
 use sha2::{Digest, Sha256};
 use std::{
@@ -24,19 +24,12 @@ pub(crate) fn trusted_arm64_test_sidecar() -> TrustedSha256 {
     TrustedSha256::from_bytes(ARM64_TEST_SIDECAR_SHA256)
 }
 
-/// The D4 client candidate has deliberately not received independent approval.
-/// Until a value is reviewed and committed here, the real scanner path is closed.
+/// Resolve only the independently approved D4 Minolta client binary.
 pub(crate) fn resolve_approved_minolta_client(resource_dir: &Path) -> io::Result<ResolvedSidecar> {
-    // Current D4 candidate binary hash is documented in the D4 audit only. It
-    // must never be copied into this trust anchor automatically; the value
-    // remains None until separate approval.
-    const APPROVED_MINOLTA_CLIENT_SHA256: Option<&str> = None;
-    let value = APPROVED_MINOLTA_CLIENT_SHA256.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "Minolta-Client ist gesperrt: unabhängige SHA-256-Freigabe steht aus",
-        )
-    })?;
+    // Explicit release approval for the exact ARM64 candidate reviewed in D4-HW1.
+    const APPROVED_MINOLTA_CLIENT_SHA256: &str =
+        "9049bb63b6a6a81ef1d686172f063d3949939e3acca7786fc3a414cb21d36aa6";
+    let value = APPROVED_MINOLTA_CLIENT_SHA256;
     if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -65,7 +58,6 @@ impl TrustedSha256 {
 }
 
 #[derive(Clone, Copy, Debug)]
-#[allow(dead_code)] // Minolta resource remains unavailable until its trust hash is approved.
 pub(crate) enum SidecarResource {
     Arm64Test,
     MinoltaClient,
@@ -547,13 +539,34 @@ mod tests {
     }
 
     #[test]
-    fn minolta_client_resource_remains_unlaunchable_without_independent_hash_approval() {
+    fn approved_minolta_resource_requires_the_exact_pinned_hash() {
+        use std::os::unix::fs::PermissionsExt;
+
         let root =
-            std::env::temp_dir().join(format!("beblog-minolta-gate-{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("beblog-minolta-approval-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
-        let error = resolve_approved_minolta_client(&root).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-        assert!(error.to_string().contains("SHA-256-Freigabe steht aus"));
+        let binary = root.join("sidecars/macos-aarch64/minolta-batch-frame");
+        fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        fs::write(
+            &binary,
+            include_bytes!("../sidecars/macos-aarch64/minolta-batch-frame"),
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        let resolved = resolve_approved_minolta_client(&root).unwrap();
+        assert_eq!(resolved.path(), fs::canonicalize(&binary).unwrap());
+        assert_eq!(
+            format!("{:x}", Sha256::digest(fs::read(&binary).unwrap())),
+            "9049bb63b6a6a81ef1d686172f063d3949939e3acca7786fc3a414cb21d36aa6"
+        );
+        let actual_digest: [u8; 32] = Sha256::digest(fs::read(&binary).unwrap()).into();
+        assert_eq!(resolved.sha256(), actual_digest);
+
+        let mut changed = fs::read(&binary).unwrap();
+        let last = changed.len() - 1;
+        changed[last] ^= 0x01;
+        fs::write(&binary, changed).unwrap();
+        assert!(resolve_approved_minolta_client(&root).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 }

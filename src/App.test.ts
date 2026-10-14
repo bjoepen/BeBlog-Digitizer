@@ -12,21 +12,29 @@ describe("App", () => {
   beforeEach(() => vi.clearAllMocks());
   afterEach(() => { cleanup(); eventState.handler = undefined; });
 
-  it("shows single-frame controls but keeps real scanner start locked pending hash approval", () => {
+  it("shows the explicitly hash-approved real scanner path while requiring device and output confirmation", async () => {
     render(App);
     expect(screen.getByRole("heading", { name: "BeBlog Digitizer" })).toBeInTheDocument();
     expect(screen.getByLabelText("Frame")).toBeInTheDocument();
     expect(screen.getByLabelText("Auflösung")).toBeInTheDocument();
     expect(screen.getByLabelText("Ausgabeordner")).toBeInTheDocument();
     expect(screen.getByText("RGB8")).toBeInTheDocument();
-    expect(screen.getByText(/Der D4-Clienthash ist noch nicht unabhängig freigegeben/)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Einzelbildscan starten" })).toBeDisabled();
+    expect(screen.getByText(/Realer Hardwarelauf ist freigeschaltet, aber noch nicht hardwaregetestet/)).toBeInTheDocument();
+    const start = screen.getByRole("button", { name: "Realen Einzelbildscan starten" });
+    expect(start).toBeDisabled();
+    await fireEvent.input(screen.getByLabelText("Scanner-Gerätebezeichner"), { target: { value: "scanner:explicit" } });
+    await fireEvent.click(screen.getByRole("button", { name: "Gerät bestätigen" }));
+    expect(start).toBeDisabled();
+    const dialog = await import("@tauri-apps/plugin-dialog");
+    vi.mocked(dialog.open).mockResolvedValueOnce("/Volumes/Scan SSD/Film");
+    await fireEvent.click(screen.getByRole("button", { name: "Ordner auswählen …" }));
+    expect(start).toBeEnabled();
   });
 
   it("does not show a holder-insertion prompt before an OPENED event", () => {
     render(App);
     expect(screen.queryByText(/Filmhalter jetzt einsetzen/)).not.toBeInTheDocument();
-    expect(screen.getByText(/erst nach einem echten Clientereignis/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Filmhalter eingesetzt bestätigen" })).not.toBeInTheDocument();
   });
 
   it("shows the holder prompt only after the actual typed OPENED event", async () => {
@@ -34,7 +42,7 @@ describe("App", () => {
     vi.mocked(dialog.open).mockResolvedValueOnce("/Volumes/Scan SSD/Film");
     render(App);
     await fireEvent.click(screen.getByRole("button", { name: "Ordner auswählen …" }));
-    await fireEvent.click(screen.getByRole("button", { name: "Geführten Ablauf simulieren" }));
+    await fireEvent.click(screen.getByRole("button", { name: "Ablauf hardwarefrei simulieren" }));
     await waitFor(() => expect(eventState.handler).toBeDefined());
     eventState.handler!({ payload: { kind: "opened" } });
     expect(await screen.findByText(/Filmhalter jetzt einsetzen/)).toBeInTheDocument();
@@ -47,7 +55,7 @@ describe("App", () => {
     vi.mocked(dialog.open).mockResolvedValueOnce("/Volumes/Scan SSD/Film");
     render(App);
     await fireEvent.click(screen.getByRole("button", { name: "Ordner auswählen …" }));
-    await fireEvent.click(screen.getByRole("button", { name: "Geführten Ablauf simulieren" }));
+    await fireEvent.click(screen.getByRole("button", { name: "Ablauf hardwarefrei simulieren" }));
     await waitFor(() => expect(eventState.handler).toBeDefined());
     eventState.handler!({ payload: { kind: "opened" } });
     await screen.findByRole("button", { name: "Filmhalter eingesetzt bestätigen" });
@@ -64,7 +72,7 @@ describe("App", () => {
     render(App);
     await fireEvent.click(screen.getByRole("button", { name: "Ordner auswählen …" }));
     expect(screen.getByLabelText("Ausgabeordner")).toHaveValue("/Volumes/Scan SSD/Film");
-    expect(screen.getByRole("button", { name: "Einzelbildscan starten" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Realen Einzelbildscan starten" })).toBeDisabled();
   });
 
   it("starts only the explicitly labelled hardware-free guided simulation from the app UI", async () => {
@@ -73,8 +81,8 @@ describe("App", () => {
     const tauri = await import("@tauri-apps/api/core");
     render(App);
     await fireEvent.click(screen.getByRole("button", { name: "Ordner auswählen …" }));
-    await fireEvent.click(screen.getByRole("button", { name: "Geführten Ablauf simulieren" }));
+    await fireEvent.click(screen.getByRole("button", { name: "Ablauf hardwarefrei simulieren" }));
     await waitFor(() => expect(tauri.invoke).toHaveBeenCalledWith("start_guided_simulation", { frame: 1, dpi: 2820, outputDirectory: "/Volumes/Scan SSD/Film" }));
-    expect(screen.getByText(/Der D4-Clienthash ist noch nicht unabhängig freigegeben/)).toBeInTheDocument();
+    expect(screen.getByText(/Realer Hardwarelauf ist freigeschaltet, aber noch nicht hardwaregetestet/)).toBeInTheDocument();
   });
 });

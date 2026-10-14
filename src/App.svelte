@@ -14,7 +14,7 @@
   let exportNotice = "";
   let simulationMode = false;
   let events: { label: string; detail: string; error?: boolean }[] = [];
-  const clientApproved = false;
+  const clientApproved = true;
   const stateNames: Record<string, string> = {
     idle: "Bereit", openingScanner: "Scanner wird initialisiert", awaitingHolderConfirmation: "Verbindung bestätigt",
     waitingForHolderDetection: "Warte auf tatsächliche Haltererkennung", positioningFrame: "Frame wird positioniert",
@@ -85,7 +85,7 @@
 <main>
   <header>
     <div><p class="eyebrow">BeBlog · Filmwerkstatt</p><h1>BeBlog Digitizer</h1><p class="subtitle">Geführter Einzelbild-Workflow für den Minolta DiMAGE Scan Dual II.</p></div>
-    <div class="adapter-badge locked"><span></span>Hardwarestart gesperrt</div>
+    <div class="adapter-badge"><span></span>Hashgebundener Minolta-Client · Hardware nicht getestet</div>
   </header>
 
   <section class="status-strip" aria-label="Scannerstatus">
@@ -123,8 +123,8 @@
 
       {#if projection.error}<p class="error-banner" role="alert">{projection.error}</p>{/if}
       {#if exportNotice}<p class="success-banner" role="status">{exportNotice}</p>{/if}
-      <div class="gate" role="status"><strong>Realer Start derzeit gesperrt.</strong><span>{clientApproved ? "Client ist freigegeben." : "Der D4-Clienthash ist noch nicht unabhängig freigegeben. Es wird kein Prozess gestartet."}</span></div>
-      <div class="actions"><button class="primary" disabled={!clientApproved || !outputFolder.trim() || !device.trim() || confirmedDevice !== device || projection.state !== "idle"} on:click={startGuidedScan}>Einzelbildscan starten</button><button class="secondary" disabled={!outputFolder.trim() || projection.state !== "idle"} on:click={startGuidedSimulation}>Geführten Ablauf simulieren</button><button class="secondary" disabled={projection.state === "idle" || projection.state === "completed" || projection.state === "failed" || projection.state === "cancelled" || projection.state === "timedOut"} on:click={cancelGuidedScan}>Abbrechen</button></div>
+      <div class="gate" role="status"><strong>Realer Hardwarelauf ist freigeschaltet, aber noch nicht hardwaregetestet.</strong><span>Der feste SHA-256-Vertrauensanker gilt ausschließlich für den geprüften ARM64-Client. Simulation und Hardwarelauf bleiben getrennte Aktionen.</span></div>
+      <div class="actions"><button class="primary" disabled={!clientApproved || !outputFolder.trim() || !device.trim() || confirmedDevice !== device || projection.state !== "idle"} on:click={startGuidedScan}>Realen Einzelbildscan starten</button><button class="secondary" disabled={!outputFolder.trim() || projection.state !== "idle"} on:click={startGuidedSimulation}>Ablauf hardwarefrei simulieren</button><button class="secondary" disabled={projection.state === "idle" || projection.state === "completed" || projection.state === "failed" || projection.state === "cancelled" || projection.state === "timedOut"} on:click={cancelGuidedScan}>Abbrechen</button></div>
     </section>
 
     <aside class="card log-card"><div class="section-heading"><div><p class="step">DIAGNOSE</p><h2>Scannerereignisse</h2></div><span>{events.length}</span></div>
