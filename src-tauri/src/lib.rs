@@ -68,6 +68,25 @@ fn cancel_batch(app: AppHandle, core: State<'_, AppCore>) -> Result<(), String> 
 }
 
 #[tauri::command]
+fn start_d6_batch(
+    app: AppHandle,
+    core: State<'_, AppCore>,
+    request: guided_process::D6BatchScanRequest,
+) -> Result<String, String> {
+    core.start_d6_batch(app, request)
+}
+
+#[tauri::command]
+fn confirm_d6_batch_holder(app: AppHandle, core: State<'_, AppCore>) -> Result<(), String> {
+    core.confirm_d6_batch_holder(&app)
+}
+
+#[tauri::command]
+fn cancel_d6_batch(app: AppHandle, core: State<'_, AppCore>) -> Result<(), String> {
+    core.cancel_d6_batch(&app)
+}
+
+#[tauri::command]
 fn start_guided_scan(
     app: AppHandle,
     core: State<'_, AppCore>,
@@ -135,6 +154,12 @@ pub fn run() {
             start_batch,
             confirm_batch_holder,
             cancel_batch,
+            start_d6_batch,
+            confirm_d6_batch_holder,
+            cancel_d6_batch,
+            start_d6_batch,
+            confirm_d6_batch_holder,
+            cancel_d6_batch,
             start_guided_scan,
             start_guided_simulation,
             confirm_guided_holder,

@@ -51,6 +51,7 @@ pub(crate) struct ValidatedD6Artifacts {
     capture_id: String,
     profile: ValidatedRgb8Profile,
     files: Vec<FileMetadata>,
+    product: OfflineCaptureProduct,
 }
 
 #[allow(dead_code)] // Accessed by the D6-B3 journal/finalization sequence.
@@ -69,6 +70,10 @@ impl ValidatedD6Artifacts {
 
     pub(crate) fn files(&self) -> &[FileMetadata] {
         &self.files
+    }
+
+    pub(crate) fn product(&self) -> &OfflineCaptureProduct {
+        &self.product
     }
 }
 
@@ -98,6 +103,19 @@ pub(crate) fn test_validated_d6_artifacts(frame: u8, capture_id: &str) -> Valida
             sha256: "0".repeat(64),
         })
         .collect(),
+        product: OfflineCaptureProduct {
+            raw: vec![0; LEGACY_600_RAW_BYTES as usize],
+            tiff: Vec::new(),
+            params_txt: Vec::new(),
+            client_log: Vec::new(),
+            profile: ValidatedRgb8Profile {
+                resolution_dpi: 600,
+                pixels_per_line: LEGACY_600_WIDTH,
+                lines: LEGACY_600_HEIGHT,
+                bytes_per_line: LEGACY_600_BYTES_PER_LINE,
+                raw_bytes: LEGACY_600_RAW_BYTES,
+            },
+        },
     }
 }
 
@@ -134,7 +152,8 @@ pub(crate) fn validate_d6_artifacts(
             media_type: match name {
                 "capture.raw" => "application/x-beblog-raw",
                 "capture.tiff" => "image/tiff",
-                _ => "text/plain",
+                "capture.params.txt" => "text/plain; profile=minolta-params",
+                _ => "text/plain; profile=minolta-client-log",
             }
             .into(),
             bytes: bytes.len() as u64,
@@ -149,11 +168,19 @@ pub(crate) fn validate_d6_artifacts(
         &contents[2],
         &contents[3],
     )?;
+    let product = OfflineCaptureProduct {
+        raw: contents[0].clone(),
+        tiff: contents[1].clone(),
+        params_txt: contents[2].clone(),
+        client_log: contents[3].clone(),
+        profile,
+    };
     Ok(ValidatedD6Artifacts {
         frame,
         capture_id: capture_id.into(),
         profile,
         files,
+        product,
     })
 }
 
@@ -174,6 +201,47 @@ pub fn export_validated_artifacts(
     let log = read_external_artifact(&sources.client_log, MAX_LOG_BYTES)?;
     validate_artifact_profile(frame, &raw, &tiff, &params, &log)?;
 
+    export_product(frame, &raw, &tiff, &params, &log, destination_root)
+}
+
+pub(crate) fn export_d6_validated_artifacts(
+    receipt: &ValidatedD6Artifacts,
+    destination_root: &Path,
+) -> io::Result<PathBuf> {
+    let product = receipt.product();
+    let profile = validate_artifact_profile(
+        receipt.frame(),
+        &product.raw,
+        &product.tiff,
+        &product.params_txt,
+        &product.client_log,
+    )?;
+    if profile != receipt.profile() || profile != product.profile {
+        return Err(invalid_data(
+            "D6-Validierungsbeleg stimmt nicht mit den Artefakten überein",
+        ));
+    }
+    export_product(
+        receipt.frame(),
+        &product.raw,
+        &product.tiff,
+        &product.params_txt,
+        &product.client_log,
+        destination_root,
+    )
+}
+
+fn export_product(
+    frame: u8,
+    raw: &[u8],
+    tiff: &[u8],
+    params: &[u8],
+    log: &[u8],
+    destination_root: &Path,
+) -> io::Result<PathBuf> {
+    if !(1..=6).contains(&frame) {
+        return Err(invalid_data("Export akzeptiert ausschließlich Frames 1–6"));
+    }
     fs::create_dir_all(destination_root)?;
     let metadata = fs::symlink_metadata(destination_root)?;
     if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
@@ -182,10 +250,10 @@ pub fn export_validated_artifacts(
     let root = fs::canonicalize(destination_root)?;
     let export_dir = reserve_export_directory(&root)?;
     for (name, bytes) in [
-        ("capture.raw", raw.as_slice()),
-        ("capture.tiff", tiff.as_slice()),
-        ("capture.params.txt", params.as_slice()),
-        ("capture.client.log", log.as_slice()),
+        ("capture.raw", raw),
+        ("capture.tiff", tiff),
+        ("capture.params.txt", params),
+        ("capture.client.log", log),
     ] {
         let result = (|| {
             let mut file = OpenOptions::new()
@@ -1500,6 +1568,98 @@ mod tests {
 
         fs::write(&paths.raw, vec![20; RAW_BYTES]).unwrap();
         assert!(validate_d6_artifacts(1, "capture-receipt", &paths).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn d6_validated_receipt_is_persisted_before_capture_finalization_and_completion() {
+        use crate::{
+            archive::ArchiveManager,
+            batch_plan::{D6BatchRequest, D6BatchStatus, D6FrameStatus},
+        };
+
+        let root = root();
+        let archive_root = root.join("archive");
+        let output = root.join("export");
+        fs::create_dir_all(&output).unwrap();
+        let archive = ArchiveManager::new(archive_root.clone());
+        let batch = archive
+            .begin_d6_batch(&D6BatchRequest { frames: vec![1, 2] })
+            .unwrap();
+        let batch_id = batch.batch_id.as_str().to_string();
+        let raw = vec![31; RAW_BYTES];
+
+        for frame in [1_u8, 2] {
+            let capture_id = format!("d6-test-capture-{frame}");
+            archive
+                .begin_d6_frame(&batch_id, frame, &capture_id)
+                .unwrap();
+            let pending = archive
+                .begin_d6_capture(&batch_id, frame, &capture_id)
+                .unwrap();
+            let work = root.join(format!("work-{frame}"));
+            let paths = write_sources(
+                &work,
+                &raw,
+                &tiff(&raw, 1, false, false),
+                &params(),
+                &log_for(frame, legacy_600_profile()),
+            );
+            let fixed = OfflineArtifactPaths {
+                raw: paths.raw.clone(),
+                tiff: paths.tiff.clone(),
+                params_txt: paths.params_txt.clone(),
+                client_log: paths.client_log.clone(),
+            };
+            let receipt = validate_d6_artifacts(frame, &capture_id, &fixed).unwrap();
+            archive
+                .mark_d6_frame_validated(&batch_id, &receipt)
+                .unwrap();
+
+            let journal_path = archive_root
+                .join("batches/d6")
+                .join(format!("{batch_id}.json"));
+            let journal: crate::batch_plan::D6BatchManifest =
+                serde_json::from_slice(&fs::read(&journal_path).unwrap()).unwrap();
+            assert_eq!(
+                journal.frames[(frame - 1) as usize].status,
+                D6FrameStatus::Validated
+            );
+            let capture_before: CaptureManifest =
+                serde_json::from_slice(&fs::read(pending.directory.join("manifest.json")).unwrap())
+                    .unwrap();
+            assert_eq!(capture_before.status, ArchiveStatus::InProgress);
+
+            let finalized = archive
+                .finalize_d6_capture(&batch_id, &pending, &receipt)
+                .unwrap();
+            assert_eq!(finalized.status, ArchiveStatus::Completed);
+            let exported = export_d6_validated_artifacts(&receipt, &output).unwrap();
+            for name in [
+                "capture.raw",
+                "capture.tiff",
+                "capture.params.txt",
+                "capture.client.log",
+            ] {
+                assert_eq!(
+                    fs::read(exported.join(name)).unwrap(),
+                    fs::read(pending.directory.join(name)).unwrap()
+                );
+            }
+            archive.complete_d6_frame(&batch_id, frame).unwrap();
+        }
+
+        let journal_path = archive_root
+            .join("batches/d6")
+            .join(format!("{batch_id}.json"));
+        let journal: crate::batch_plan::D6BatchManifest =
+            serde_json::from_slice(&fs::read(journal_path).unwrap()).unwrap();
+        assert_eq!(journal.status, D6BatchStatus::Completed);
+        assert!(journal
+            .frames
+            .iter()
+            .all(|frame| frame.status == D6FrameStatus::Completed));
+        assert_ne!(journal.frames[0].capture_id, journal.frames[1].capture_id);
         fs::remove_dir_all(root).unwrap();
     }
 

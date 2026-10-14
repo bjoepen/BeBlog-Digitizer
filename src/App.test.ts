@@ -1,8 +1,8 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/svelte";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const eventState = vi.hoisted(() => ({ handler: undefined as undefined | ((event: { payload: unknown }) => void) }));
-vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async (_name: string, handler: (event: { payload: unknown }) => void) => { eventState.handler = handler; return () => {}; }) }));
+const eventState = vi.hoisted(() => ({ handlers: {} as Record<string, (event: { payload: unknown }) => void> }));
+vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async (name: string, handler: (event: { payload: unknown }) => void) => { eventState.handlers[name] = handler; return () => {}; }) }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(async () => "guided-test-run") }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn(async () => null) }));
 
@@ -10,7 +10,7 @@ import App from "./App.svelte";
 
 describe("App", () => {
   beforeEach(() => vi.clearAllMocks());
-  afterEach(() => { cleanup(); eventState.handler = undefined; });
+  afterEach(() => { cleanup(); eventState.handlers = {}; });
 
   it("shows the explicitly hash-approved real scanner path while requiring device and output confirmation", async () => {
     render(App);
@@ -101,8 +101,8 @@ describe("App", () => {
     render(App);
     await fireEvent.click(screen.getByRole("button", { name: "Ordner auswählen …" }));
     await fireEvent.click(screen.getByRole("button", { name: "Ablauf hardwarefrei simulieren" }));
-    await waitFor(() => expect(eventState.handler).toBeDefined());
-    eventState.handler!({ payload: { kind: "opened" } });
+    await waitFor(() => expect(eventState.handlers["hardware-client-event"]).toBeDefined());
+    eventState.handlers["hardware-client-event"]({ payload: { kind: "opened" } });
     expect(await screen.findByText(/Filmhalter jetzt einsetzen/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Filmhalter eingesetzt bestätigen" })).toBeInTheDocument();
   });
@@ -114,8 +114,8 @@ describe("App", () => {
     render(App);
     await fireEvent.click(screen.getByRole("button", { name: "Ordner auswählen …" }));
     await fireEvent.click(screen.getByRole("button", { name: "Ablauf hardwarefrei simulieren" }));
-    await waitFor(() => expect(eventState.handler).toBeDefined());
-    eventState.handler!({ payload: { kind: "opened" } });
+    await waitFor(() => expect(eventState.handlers["hardware-client-event"]).toBeDefined());
+    eventState.handlers["hardware-client-event"]({ payload: { kind: "opened" } });
     await screen.findByRole("button", { name: "Filmhalter eingesetzt bestätigen" });
     expect(vi.mocked(tauri.invoke)).not.toHaveBeenCalledWith("confirm_guided_holder");
     expect(screen.queryByText("Benutzerbestätigung")).not.toBeInTheDocument();

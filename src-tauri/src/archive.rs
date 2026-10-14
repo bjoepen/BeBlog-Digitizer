@@ -87,7 +87,7 @@ pub struct CaptureManifest {
     pub failure: Option<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PendingCapture {
     pub id: String,
     pub directory: PathBuf,
@@ -101,7 +101,7 @@ pub struct CaptureProduct {
     pub kind: CaptureKind,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OfflineCaptureProduct {
     pub raw: Vec<u8>,
     pub tiff: Vec<u8>,
@@ -227,6 +227,66 @@ impl ArchiveManager {
             entry.validated_artifacts = Some(receipt.files().to_vec());
             Ok(())
         })
+    }
+
+    pub(crate) fn begin_d6_capture(
+        &self,
+        batch_id: &str,
+        frame: u8,
+        capture_id: &str,
+    ) -> io::Result<PendingCapture> {
+        validate_archive_id(batch_id)?;
+        validate_archive_id(capture_id)?;
+        let journal_path = d6_batch_path(&self.root.join("batches").join("d6"), batch_id);
+        let journal: D6BatchManifest = serde_json::from_slice(&fs::read(journal_path)?)?;
+        journal.validate().map_err(invalid_data)?;
+        if !journal.frames.iter().any(|entry| {
+            entry.frame == frame
+                && entry.status == D6FrameStatus::Running
+                && entry.capture_id.as_deref() == Some(capture_id)
+        }) {
+            return Err(invalid_data(
+                "D6-Capture kann nur für die zuvor persistierte Framezuordnung reserviert werden",
+            ));
+        }
+        let request = StartScanRequest {
+            frame,
+            simulation: crate::model::SimulationMode::Success,
+        };
+        self.begin_with_id(
+            capture_id,
+            &request,
+            CaptureKind::OfflineImport,
+            Some(batch_id.to_string()),
+            0,
+            0,
+        )
+    }
+
+    pub(crate) fn finalize_d6_capture(
+        &self,
+        batch_id: &str,
+        pending: &PendingCapture,
+        receipt: &crate::offline_import::ValidatedD6Artifacts,
+    ) -> io::Result<CaptureManifest> {
+        if pending.id != receipt.capture_id() {
+            return Err(invalid_data(
+                "D6-Validierungsbeleg gehört nicht zum Capture",
+            ));
+        }
+        let manifest = read_manifest(&pending.directory)?;
+        if manifest.frame != receipt.frame() || manifest.batch_id.as_deref() != Some(batch_id) {
+            return Err(invalid_data(
+                "D6-Capture und Journalzuordnung stimmen nicht überein",
+            ));
+        }
+        let finalized = self.finalize_offline_import(pending, receipt.product().clone())?;
+        if !same_file_digests(&finalized.files, receipt.files()) {
+            return Err(invalid_data(
+                "Archivdateien weichen vom validierten D6-Beleg ab",
+            ));
+        }
+        Ok(finalized)
     }
 
     /// Journal completion is permitted only after the prior durable Validated
@@ -967,6 +1027,17 @@ fn write_manifest(directory: &Path, manifest: &CaptureManifest) -> io::Result<()
 
 fn invalid_data(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+fn same_file_digests(left: &[FileMetadata], right: &[FileMetadata]) -> bool {
+    left.len() == right.len()
+        && left.iter().all(|file| {
+            right.iter().any(|candidate| {
+                candidate.name == file.name
+                    && candidate.bytes == file.bytes
+                    && candidate.sha256 == file.sha256
+            })
+        })
 }
 
 fn ensure_public_capture_kind(kind: CaptureKind) -> io::Result<()> {

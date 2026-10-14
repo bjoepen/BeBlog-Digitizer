@@ -1,7 +1,11 @@
 use crate::{
     adapter::{AdapterStep, FakeScannerAdapter, ScannerAdapter},
     archive::{ArchiveManager, ArchiveStatus, BatchArchiveStatus, PendingCapture},
-    guided_process::{GuidedProcessController, GuidedScanRequest},
+    batch_plan::D6BatchRequest,
+    guided_process::{
+        D6BatchPhase, D6BatchScanRequest, D6BatchUiEvent, GuidedProcessController,
+        GuidedScanRequest,
+    },
     model::{
         AppSnapshot, BatchSnapshot, EventLevel, HolderStatus, ScanError, ScanEvent, ScanState,
         SimulationMode, StartBatchRequest, StartScanRequest,
@@ -50,6 +54,17 @@ struct PendingBatch {
     cooldown_remaining: u8,
 }
 
+struct ActiveD6Batch {
+    id: String,
+    request: D6BatchScanRequest,
+    cancelled: Arc<AtomicBool>,
+    current_frame: Option<u8>,
+    completed_frames: u8,
+    cooldown_remaining: u8,
+    awaiting_holder_confirmation: bool,
+    cleanup_uncertain: bool,
+}
+
 struct CoreData {
     active: Option<ActiveJob>,
     state: ScanState,
@@ -57,6 +72,7 @@ struct CoreData {
     holder_detected: bool,
     jobs: Vec<JobSummary>,
     batch: Option<PendingBatch>,
+    d6_batch: Option<ActiveD6Batch>,
     scanner_lease: Option<ScannerLeaseGuard>,
     recovery_notices: Vec<String>,
 }
@@ -70,6 +86,7 @@ impl Default for CoreData {
             holder_detected: false,
             jobs: Vec::new(),
             batch: None,
+            d6_batch: None,
             scanner_lease: None,
             recovery_notices: Vec::new(),
         }
@@ -336,6 +353,509 @@ impl AppCore {
             ));
         }
         scanner_discovery::discover()
+    }
+
+    pub fn start_d6_batch<R: tauri::Runtime + 'static>(
+        &self,
+        app: AppHandle<R>,
+        request: D6BatchScanRequest,
+    ) -> Result<String, String> {
+        self.start_d6_batch_inner(app, request, false)
+    }
+
+    #[cfg(test)]
+    fn start_d6_batch_simulation<R: tauri::Runtime + 'static>(
+        &self,
+        app: AppHandle<R>,
+        request: D6BatchScanRequest,
+    ) -> Result<String, String> {
+        self.start_d6_batch_inner(app, request, true)
+    }
+
+    fn start_d6_batch_inner<R: tauri::Runtime + 'static>(
+        &self,
+        app: AppHandle<R>,
+        request: D6BatchScanRequest,
+        test_simulator: bool,
+    ) -> Result<String, String> {
+        let plan = D6BatchRequest {
+            frames: request.frames.clone(),
+        };
+        plan.validate()?;
+        let initial = guided_request_for_d6(&request, request.frames[0]);
+        crate::guided_process::validate_request(&initial)?;
+        let cooldown = self.guided.cooldown_remaining_seconds();
+        if cooldown > 0 {
+            return Err(format!(
+                "Nächster Batch erst nach dem Cooldown in {cooldown} s"
+            ));
+        }
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (id, event) = {
+            let mut data = self.data.lock().map_err(|_| "Interner Zustandsfehler")?;
+            ensure_idle(&data)?;
+            let lease = self.scanner_lease.acquire(ScannerAction::D6Batch)?;
+            let manifest = self.archive.begin_d6_batch(&plan).map_err(|error| {
+                format!("D6-Batchjournal konnte nicht angelegt werden: {error}")
+            })?;
+            let id = manifest.batch_id.as_str().to_string();
+            data.scanner_lease = Some(lease);
+            data.d6_batch = Some(ActiveD6Batch {
+                id: id.clone(),
+                request: request.clone(),
+                cancelled: cancelled.clone(),
+                current_frame: None,
+                completed_frames: 0,
+                cooldown_remaining: 0,
+                awaiting_holder_confirmation: false,
+                cleanup_uncertain: false,
+            });
+            data.state = ScanState::Initializing;
+            data.progress = 0;
+            data.holder_detected = false;
+            let event = d6_event(
+                data.d6_batch.as_ref().unwrap(),
+                D6BatchPhase::Starting,
+                "D6-Batch gestartet; der erste neue Clientprozess wird vorbereitet".into(),
+            );
+            (id, event)
+        };
+        emit_d6(&app, event);
+        let core = self.clone();
+        let worker_id = id.clone();
+        std::thread::spawn(move || {
+            core.run_d6_batch(app, worker_id, request, cancelled, test_simulator)
+        });
+        Ok(id)
+    }
+
+    pub fn confirm_d6_batch_holder<R: tauri::Runtime>(
+        &self,
+        app: &AppHandle<R>,
+    ) -> Result<(), String> {
+        {
+            let data = self.data.lock().map_err(|_| "Interner Zustandsfehler")?;
+            let batch = data.d6_batch.as_ref().ok_or("Kein aktiver D6-Batch")?;
+            if !batch.awaiting_holder_confirmation || batch.current_frame != Some(1) {
+                return Err("Die manuelle Halterbestätigung ist derzeit nicht angefordert".into());
+            }
+        }
+        self.guided.confirm_holder()?;
+        let event = {
+            let mut data = self.data.lock().map_err(|_| "Interner Zustandsfehler")?;
+            let batch = data.d6_batch.as_mut().ok_or("D6-Batch wurde beendet")?;
+            batch.awaiting_holder_confirmation = false;
+            d6_event(
+                batch,
+                D6BatchPhase::WaitingForHolderDetection,
+                "Einlegen bestätigt; tatsächliche Haltererkennung wird abgewartet".into(),
+            )
+        };
+        emit_d6(app, event);
+        Ok(())
+    }
+
+    pub fn cancel_d6_batch<R: tauri::Runtime>(&self, app: &AppHandle<R>) -> Result<(), String> {
+        let event = {
+            let mut data = self.data.lock().map_err(|_| "Interner Zustandsfehler")?;
+            data.state = ScanState::Cancelling;
+            let batch = data.d6_batch.as_mut().ok_or("Kein aktiver D6-Batch")?;
+            batch.cancelled.store(true, Ordering::SeqCst);
+            batch.awaiting_holder_confirmation = false;
+            d6_event(
+                batch,
+                D6BatchPhase::Cancelling,
+                "Batchabbruch angefordert; aktiver Client wird kontrolliert beendet".into(),
+            )
+        };
+        emit_d6(app, event);
+        Ok(())
+    }
+
+    fn run_d6_batch<R: tauri::Runtime + 'static>(
+        &self,
+        app: AppHandle<R>,
+        batch_id: String,
+        request: D6BatchScanRequest,
+        cancelled: Arc<AtomicBool>,
+        test_simulator: bool,
+    ) {
+        let mut all_cleanups_confirmed = true;
+        for (index, frame) in request.frames.iter().copied().enumerate() {
+            if cancelled.load(Ordering::SeqCst) {
+                break;
+            }
+            let capture_id = format!("d6-capture-{}", uuid::Uuid::new_v4().simple());
+            let frame_id = match self.archive.begin_d6_frame(&batch_id, frame, &capture_id) {
+                Ok(frame_id) => frame_id,
+                Err(error) => {
+                    self.finish_d6_batch(
+                        &app,
+                        &batch_id,
+                        D6BatchPhase::Failed,
+                        ScanState::BatchFailed,
+                        format!("Frame {frame}: Zuordnung im Batchjournal fehlgeschlagen: {error}"),
+                        true,
+                    );
+                    return;
+                }
+            };
+            let pending = match self.archive.begin_d6_capture(&batch_id, frame, &capture_id) {
+                Ok(pending) => pending,
+                Err(error) => {
+                    let journal_error = self
+                        .archive
+                        .fail_d6_frame(&batch_id, frame, format!("Capture-Reservierung: {error}"))
+                        .err();
+                    let suffix = journal_error
+                        .map(|error| format!("; Journalfehler: {error}"))
+                        .unwrap_or_default();
+                    self.finish_d6_batch(
+                        &app,
+                        &batch_id,
+                        D6BatchPhase::Failed,
+                        ScanState::BatchFailed,
+                        format!("Frame {frame}: Capture konnte nicht reserviert werden: {error}{suffix}"),
+                        true,
+                    );
+                    return;
+                }
+            };
+            self.update_d6_progress(
+                &app,
+                &batch_id,
+                Some(frame),
+                0,
+                D6BatchPhase::Starting,
+                format!(
+                    "Frame {frame} von {} wird vorbereitet ({frame_id})",
+                    request.frames.len()
+                ),
+            );
+            let scan_request = guided_request_for_d6(&request, frame);
+            let (finished_tx, finished_rx) = std::sync::mpsc::sync_channel(1);
+            let core_for_event = self.clone();
+            let app_for_event = app.clone();
+            let batch_for_event = batch_id.clone();
+            let auto_continue = index > 0;
+            let on_client_event = move |client_event| {
+                core_for_event.note_d6_process_event(
+                    &app_for_event,
+                    &batch_for_event,
+                    frame,
+                    auto_continue,
+                    client_event,
+                );
+            };
+            let on_finished = move |result, cleanup_confirmed| {
+                let _ = finished_tx.send((result, cleanup_confirmed));
+            };
+            let launch = if test_simulator {
+                #[cfg(test)]
+                {
+                    self.guided.start_d6_simulated_single_frame(
+                        app.clone(),
+                        self.archive.root_path().join(".client-work"),
+                        self.archive.clone(),
+                        scan_request,
+                        batch_id.clone(),
+                        pending.clone(),
+                        cancelled.clone(),
+                        auto_continue,
+                        on_client_event,
+                        on_finished,
+                    )
+                }
+                #[cfg(not(test))]
+                {
+                    unreachable!("test simulator cannot be selected in production")
+                }
+            } else {
+                self.guided.start_d6_single_frame(
+                    app.clone(),
+                    self.resource_dir.clone(),
+                    self.archive.root_path().join(".client-work"),
+                    self.archive.clone(),
+                    scan_request,
+                    batch_id.clone(),
+                    pending.clone(),
+                    cancelled.clone(),
+                    auto_continue,
+                    on_client_event,
+                    on_finished,
+                )
+            };
+            if let Err(error) = launch {
+                let _ = self
+                    .archive
+                    .mark(&pending, ArchiveStatus::Failed, error.clone());
+                let journal_error = self
+                    .archive
+                    .fail_d6_frame(&batch_id, frame, error.clone())
+                    .err();
+                let suffix = journal_error
+                    .map(|error| format!("; Journalfehler: {error}"))
+                    .unwrap_or_default();
+                self.finish_d6_batch(
+                    &app,
+                    &batch_id,
+                    D6BatchPhase::Failed,
+                    ScanState::BatchFailed,
+                    format!("Frame {frame}: Clientstart fehlgeschlagen: {error}{suffix}"),
+                    true,
+                );
+                return;
+            }
+            let (result, cleanup_confirmed) = match finished_rx.recv() {
+                Ok(value) => value,
+                Err(error) => {
+                    self.finish_d6_batch(
+                        &app,
+                        &batch_id,
+                        D6BatchPhase::Failed,
+                        ScanState::BatchFailed,
+                        format!("Frame {frame}: Prozessabschluss konnte nicht bestätigt werden: {error}"),
+                        false,
+                    );
+                    return;
+                }
+            };
+            all_cleanups_confirmed &= cleanup_confirmed;
+            if let Err(error) = result {
+                let was_cancelled = cancelled.load(Ordering::SeqCst);
+                let capture_status = if was_cancelled {
+                    ArchiveStatus::Cancelled
+                } else {
+                    ArchiveStatus::Failed
+                };
+                let _ = self.archive.mark(&pending, capture_status, error.clone());
+                let journal_error = if was_cancelled {
+                    self.archive
+                        .cancel_d6_batch(&batch_id, Some(frame), error.clone())
+                        .err()
+                } else {
+                    self.archive
+                        .fail_d6_frame(&batch_id, frame, error.clone())
+                        .err()
+                };
+                let suffix = journal_error
+                    .map(|error| format!("; D6-Journalfehler: {error}; Recovery erforderlich"))
+                    .unwrap_or_default();
+                let phase = if was_cancelled {
+                    D6BatchPhase::Cancelled
+                } else {
+                    D6BatchPhase::Failed
+                };
+                let state = if was_cancelled {
+                    ScanState::BatchCancelled
+                } else {
+                    ScanState::BatchFailed
+                };
+                self.finish_d6_batch(
+                    &app,
+                    &batch_id,
+                    phase,
+                    state,
+                    format!("Frame {frame}: {error}{suffix}"),
+                    cleanup_confirmed,
+                );
+                return;
+            }
+            {
+                let mut data = self.data.lock().expect("core mutex poisoned");
+                if let Some(batch) = data.d6_batch.as_mut().filter(|batch| batch.id == batch_id) {
+                    batch.completed_frames = batch.completed_frames.saturating_add(1);
+                    batch.awaiting_holder_confirmation = false;
+                }
+            }
+            if cancelled.load(Ordering::SeqCst) && index + 1 < request.frames.len() {
+                let journal_error = self
+                    .archive
+                    .cancel_d6_batch(&batch_id, None, "Batch nach Frameabschluss abgebrochen")
+                    .err();
+                let suffix = journal_error
+                    .map(|error| format!("; D6-Journalfehler: {error}; Recovery erforderlich"))
+                    .unwrap_or_default();
+                self.finish_d6_batch(
+                    &app,
+                    &batch_id,
+                    D6BatchPhase::Cancelled,
+                    ScanState::BatchCancelled,
+                    format!(
+                        "Batch abgebrochen; bereits archivierte Frames bleiben erhalten{suffix}"
+                    ),
+                    all_cleanups_confirmed,
+                );
+                return;
+            }
+            if index + 1 < request.frames.len() {
+                let cooldown_completed = wait_d6_cooldown(
+                    self.clock.as_ref(),
+                    &cancelled,
+                    |remaining| {
+                        self.update_d6_progress(
+                        &app,
+                        &batch_id,
+                        Some(frame),
+                        remaining,
+                        D6BatchPhase::InterFrameCooldown,
+                        format!("Frame {frame} archiviert; nächster Prozess startet nach {remaining} Sekunden"),
+                    );
+                    },
+                );
+                if !cooldown_completed {
+                    let journal_error = self
+                        .archive
+                        .cancel_d6_batch(&batch_id, None, "Abbruch während Cooldown")
+                        .err();
+                    let suffix = journal_error
+                        .map(|error| format!("; D6-Journalfehler: {error}; Recovery erforderlich"))
+                        .unwrap_or_default();
+                    self.finish_d6_batch(
+                        &app,
+                        &batch_id,
+                        D6BatchPhase::Cancelled,
+                        ScanState::BatchCancelled,
+                        format!("Batch während der Bereitschaftspause abgebrochen; abgeschlossene Frames bleiben erhalten{suffix}"),
+                        all_cleanups_confirmed,
+                    );
+                    return;
+                }
+            }
+        }
+        let all_frames_completed = self
+            .data
+            .lock()
+            .expect("core mutex poisoned")
+            .d6_batch
+            .as_ref()
+            .is_some_and(|batch| batch.completed_frames as usize == batch.request.frames.len());
+        if cancelled.load(Ordering::SeqCst) && !all_frames_completed {
+            let journal_error = self
+                .archive
+                .cancel_d6_batch(&batch_id, None, "Batch vor dem nächsten Frame abgebrochen")
+                .err();
+            let suffix = journal_error
+                .map(|error| format!("; D6-Journalfehler: {error}; Recovery erforderlich"))
+                .unwrap_or_default();
+            self.finish_d6_batch(
+                &app,
+                &batch_id,
+                D6BatchPhase::Cancelled,
+                ScanState::BatchCancelled,
+                format!("Batch abgebrochen; abgeschlossene Frames bleiben erhalten{suffix}"),
+                all_cleanups_confirmed,
+            );
+        } else {
+            self.finish_d6_batch(
+                &app,
+                &batch_id,
+                D6BatchPhase::Completed,
+                ScanState::BatchCompleted,
+                "Alle D6-Frames wurden validiert, archiviert und exportiert".into(),
+                all_cleanups_confirmed,
+            );
+        }
+    }
+
+    fn note_d6_process_event<R: tauri::Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        id: &str,
+        frame: u8,
+        auto_continue: bool,
+        client_event: crate::guided_protocol::ClientEvent,
+    ) {
+        let (phase, awaiting, message) = match client_event {
+            crate::guided_protocol::ClientEvent::Opened => (
+                if auto_continue {
+                    D6BatchPhase::WaitingForHolderDetection
+                } else {
+                    D6BatchPhase::AwaitingHolderConfirmation
+                },
+                !auto_continue,
+                if auto_continue {
+                    format!("Frame {frame}: OPENED empfangen; Filmhalter bleibt eingesetzt, CONTINUE wird gesendet")
+                } else {
+                    "OPENED empfangen; Filmhalter jetzt einsetzen und bestätigen".into()
+                },
+            ),
+            crate::guided_protocol::ClientEvent::HolderDetected => (
+                D6BatchPhase::Scanning,
+                false,
+                format!("Frame {frame}: Halter durch den Scanner erkannt"),
+            ),
+            crate::guided_protocol::ClientEvent::DataChunk { total, .. } => (
+                D6BatchPhase::Scanning,
+                false,
+                format!("Frame {frame}: Datenübertragung bei {total} Byte"),
+            ),
+            crate::guided_protocol::ClientEvent::Eof { total } => (
+                D6BatchPhase::Scanning,
+                false,
+                format!("Frame {frame}: EOF nach {total} Byte; Artefakte werden geprüft"),
+            ),
+            _ => return,
+        };
+        let event = {
+            let mut data = self.data.lock().expect("core mutex poisoned");
+            let Some(batch) = data.d6_batch.as_mut().filter(|batch| batch.id == id) else {
+                return;
+            };
+            batch.current_frame = Some(frame);
+            batch.awaiting_holder_confirmation = awaiting;
+            d6_event(batch, phase, message)
+        };
+        emit_d6(app, event);
+    }
+
+    fn update_d6_progress<R: tauri::Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        id: &str,
+        frame: Option<u8>,
+        cooldown: u8,
+        phase: D6BatchPhase,
+        message: String,
+    ) {
+        let event = {
+            let mut data = self.data.lock().expect("core mutex poisoned");
+            let Some(batch) = data.d6_batch.as_mut().filter(|batch| batch.id == id) else {
+                return;
+            };
+            batch.current_frame = frame;
+            batch.cooldown_remaining = cooldown;
+            d6_event(batch, phase, message)
+        };
+        emit_d6(app, event);
+    }
+
+    fn finish_d6_batch<R: tauri::Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        id: &str,
+        phase: D6BatchPhase,
+        state: ScanState,
+        message: String,
+        cleanup_confirmed: bool,
+    ) {
+        let event = {
+            let mut data = self.data.lock().expect("core mutex poisoned");
+            data.state = state;
+            let Some(batch) = data.d6_batch.as_mut().filter(|batch| batch.id == id) else {
+                return;
+            };
+            if !cleanup_confirmed {
+                batch.cleanup_uncertain = true;
+            }
+            let event = d6_event(batch, phase, message);
+            if cleanup_confirmed {
+                data.d6_batch = None;
+                data.scanner_lease = None;
+            }
+            event
+        };
+        emit_d6(app, event);
     }
 
     pub fn guided_cooldown_remaining_seconds(&self) -> u64 {
@@ -1104,7 +1624,11 @@ impl AppCore {
 }
 
 fn ensure_idle(data: &CoreData) -> Result<(), String> {
-    if data.active.is_some() || data.batch.is_some() || data.scanner_lease.is_some() {
+    if data.active.is_some()
+        || data.batch.is_some()
+        || data.d6_batch.is_some()
+        || data.scanner_lease.is_some()
+    {
         Err("Ein Scannerjob ist bereits aktiv".into())
     } else {
         Ok(())
@@ -1165,8 +1689,9 @@ fn guided_completion_callback(
     data_ref: Arc<Mutex<CoreData>>,
     app: AppHandle,
     cancelled: Arc<AtomicBool>,
-) -> impl FnOnce(bool, bool) + Send + 'static {
-    move |succeeded, cleanup_confirmed| {
+) -> impl FnOnce(Result<(), String>, bool) + Send + 'static {
+    move |result, cleanup_confirmed| {
+        let succeeded = result.is_ok();
         let state = if succeeded {
             ScanState::Completed
         } else if cancelled.load(Ordering::SeqCst) {
@@ -1198,6 +1723,45 @@ fn guided_completion_callback(
             ),
         );
     }
+}
+
+fn guided_request_for_d6(request: &D6BatchScanRequest, frame: u8) -> GuidedScanRequest {
+    GuidedScanRequest {
+        frame,
+        dpi: request.dpi,
+        device: request.device.clone(),
+        confirmed_device: request.confirmed_device.clone(),
+        output_directory: request.output_directory.clone(),
+    }
+}
+
+fn d6_event(batch: &ActiveD6Batch, phase: D6BatchPhase, message: String) -> D6BatchUiEvent {
+    D6BatchUiEvent {
+        batch_id: batch.id.clone(),
+        phase,
+        current_frame: batch.current_frame,
+        completed_frames: batch.completed_frames,
+        total_frames: batch.request.frames.len() as u8,
+        cooldown_remaining_seconds: batch.cooldown_remaining,
+        awaiting_holder_confirmation: batch.awaiting_holder_confirmation,
+        scanner_lease_retained: batch.cleanup_uncertain,
+        message,
+    }
+}
+
+fn wait_d6_cooldown(
+    clock: &dyn BatchClock,
+    cancelled: &AtomicBool,
+    mut on_second: impl FnMut(u8),
+) -> bool {
+    for remaining in (1..=30).rev() {
+        if cancelled.load(Ordering::SeqCst) {
+            return false;
+        }
+        on_second(remaining);
+        clock.wait_second(cancelled);
+    }
+    !cancelled.load(Ordering::SeqCst)
 }
 
 fn finish_guided_slot(
@@ -1254,6 +1818,10 @@ fn emit(app: &AppHandle, event: ScanEvent) {
     let _ = app.emit("scan-event", event);
 }
 
+fn emit_d6<R: tauri::Runtime>(app: &AppHandle<R>, event: D6BatchUiEvent) {
+    let _ = app.emit("d6-batch-event", event);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1263,6 +1831,193 @@ mod tests {
         fn wait_second(&self, _: &AtomicBool) {
             self.0.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    struct CancelOnTick(AtomicU64);
+    impl BatchClock for CancelOnTick {
+        fn wait_second(&self, cancelled: &AtomicBool) {
+            if self.0.fetch_add(1, Ordering::SeqCst) == 2 {
+                cancelled.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
+    struct CancelDuringCooldown(AtomicU64);
+    impl BatchClock for CancelDuringCooldown {
+        fn wait_second(&self, cancelled: &AtomicBool) {
+            if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                cancelled.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
+    #[test]
+    fn d6_cooldown_is_thirty_core_owned_ticks_and_stops_on_cancel() {
+        let clock = CountingClock(AtomicU64::new(0));
+        let cancelled = AtomicBool::new(false);
+        let mut countdown = Vec::new();
+        assert!(wait_d6_cooldown(&clock, &cancelled, |second| countdown.push(second)));
+        assert_eq!(clock.0.load(Ordering::SeqCst), 30);
+        assert_eq!(countdown, (1..=30).rev().collect::<Vec<_>>());
+
+        let clock = CancelOnTick(AtomicU64::new(0));
+        let cancelled = AtomicBool::new(false);
+        let mut countdown = Vec::new();
+        assert!(!wait_d6_cooldown(&clock, &cancelled, |second| countdown.push(second)));
+        assert_eq!(countdown, vec![30, 29, 28]);
+        assert!(cancelled.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn d6_simulator_batches_of_two_four_and_six_use_d5_runner_and_complete_journals() {
+        for count in [2_u8, 4, 6] {
+            let root = std::env::temp_dir().join(format!(
+                "beblog-d6-core-sim-{count}-{}",
+                uuid::Uuid::new_v4()
+            ));
+            let output = root.join("output");
+            std::fs::create_dir_all(&output).unwrap();
+            let clock = Arc::new(CountingClock(AtomicU64::new(0)));
+            let core = AppCore::new_with_clock(root.join("archive"), clock.clone());
+            let app = tauri::test::mock_app();
+            let handle = app.handle().clone();
+            let frames = (1..=count).collect::<Vec<_>>();
+            let batch_id = core
+                .start_d6_batch_simulation(
+                    handle.clone(),
+                    D6BatchScanRequest {
+                        frames: frames.clone(),
+                        dpi: 600,
+                        device: "simulator:hardware-free".into(),
+                        confirmed_device: "simulator:hardware-free".into(),
+                        output_directory: output.clone(),
+                    },
+                )
+                .unwrap();
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut confirmed = false;
+            loop {
+                let should_confirm = core
+                    .data
+                    .lock()
+                    .unwrap()
+                    .d6_batch
+                    .as_ref()
+                    .is_some_and(|batch| batch.awaiting_holder_confirmation);
+                if should_confirm && !confirmed {
+                    core.confirm_d6_batch_holder(&handle).unwrap();
+                    confirmed = true;
+                }
+                if core.data.lock().unwrap().d6_batch.as_ref().is_none() {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "D6 simulator batch timed out"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(confirmed, "first frame must require explicit confirmation");
+            assert_eq!(core.snapshot().state, ScanState::BatchCompleted);
+            assert_eq!(clock.0.load(Ordering::SeqCst), u64::from((count - 1) * 30));
+            let journal_path = root
+                .join("archive/batches/d6")
+                .join(format!("{batch_id}.json"));
+            let journal: crate::batch_plan::D6BatchManifest =
+                serde_json::from_slice(&std::fs::read(journal_path).unwrap()).unwrap();
+            assert_eq!(journal.status, crate::batch_plan::D6BatchStatus::Completed);
+            assert_eq!(journal.frames.len(), usize::from(count));
+            assert!(journal.frames.iter().all(|entry| {
+                entry.status == crate::batch_plan::D6FrameStatus::Completed
+                    && entry
+                        .validated_artifacts
+                        .as_ref()
+                        .is_some_and(|files| files.len() == 4)
+            }));
+            let capture_ids = journal
+                .frames
+                .iter()
+                .map(|entry| entry.capture_id.as_ref().unwrap())
+                .collect::<std::collections::HashSet<_>>();
+            assert_eq!(capture_ids.len(), usize::from(count));
+            let exported = std::fs::read_dir(&output).unwrap().count();
+            assert_eq!(exported, usize::from(count));
+            assert!(core.data.lock().unwrap().scanner_lease.is_none());
+            drop(app);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn d6_cancel_during_cooldown_keeps_completed_capture_and_does_not_start_next_frame() {
+        let root = std::env::temp_dir().join(format!(
+            "beblog-d6-cancel-cooldown-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let output = root.join("output");
+        std::fs::create_dir_all(&output).unwrap();
+        let clock = Arc::new(CancelDuringCooldown(AtomicU64::new(0)));
+        let core = AppCore::new_with_clock(root.join("archive"), clock.clone());
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+        let batch_id = core
+            .start_d6_batch_simulation(
+                handle.clone(),
+                D6BatchScanRequest {
+                    frames: vec![1, 2],
+                    dpi: 600,
+                    device: "simulator:hardware-free".into(),
+                    confirmed_device: "simulator:hardware-free".into(),
+                    output_directory: output.clone(),
+                },
+            )
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut confirmed = false;
+        loop {
+            let should_confirm = core
+                .data
+                .lock()
+                .unwrap()
+                .d6_batch
+                .as_ref()
+                .is_some_and(|batch| batch.awaiting_holder_confirmation);
+            if should_confirm && !confirmed {
+                core.confirm_d6_batch_holder(&handle).unwrap();
+                confirmed = true;
+            }
+            if core.data.lock().unwrap().d6_batch.is_none() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "D6 cancellation timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(confirmed);
+        assert_eq!(core.snapshot().state, ScanState::BatchCancelled);
+        assert_eq!(clock.0.load(Ordering::SeqCst), 1);
+        let journal_path = root
+            .join("archive/batches/d6")
+            .join(format!("{batch_id}.json"));
+        let journal: crate::batch_plan::D6BatchManifest =
+            serde_json::from_slice(&std::fs::read(journal_path).unwrap()).unwrap();
+        assert_eq!(journal.status, crate::batch_plan::D6BatchStatus::Cancelled);
+        assert_eq!(
+            journal.frames[0].status,
+            crate::batch_plan::D6FrameStatus::Completed
+        );
+        assert_eq!(
+            journal.frames[1].status,
+            crate::batch_plan::D6FrameStatus::Planned
+        );
+        assert_eq!(std::fs::read_dir(&output).unwrap().count(), 1);
+        assert!(core.data.lock().unwrap().scanner_lease.is_none());
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
