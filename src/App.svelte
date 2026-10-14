@@ -61,6 +61,18 @@
     cooldownTimer = setInterval(() => void refreshCooldown(), 1000);
   }
 
+  function confirmScannerSelection() {
+    if (!device) return;
+    confirmedDevice = device;
+    const selected = scanners.find((scanner) => scanner.id === device);
+    discoveryMessage = `${selected?.displayName ?? "Scanner"} bestätigt. Du kannst einen Einzelbildscan vorbereiten.`;
+  }
+
+  function scannerSelectionChanged() {
+    confirmedDevice = "";
+    if (device) discoveryMessage = "Scanner ausgewählt. Bitte die Auswahl ausdrücklich bestätigen.";
+  }
+
   async function detectScanners() {
     discoveryState = "searching";
     discoveryMessage = "Suche nach Minolta DiMAGE Scan Dual II …";
@@ -100,7 +112,7 @@
   }
 
   async function startGuidedScan() {
-    if (frame > 4 || cooldownRemaining > 0 || !sessionReleased) return;
+    if (cooldownRemaining > 0 || !sessionReleased) return;
     simulationMode = false;
     sessionReleased = false;
     projection = { ...initialGuidedProjection, state: "openingScanner" };
@@ -165,9 +177,8 @@
       </div>
 
       <div class="folder"><span>Ausgabeordner</span><div class="folder-row"><input aria-label="Ausgabeordner" type="text" readonly placeholder="Noch kein Ordner ausgewählt" bind:value={outputFolder} /><button class="secondary" on:click={chooseFolder}>Ordner auswählen …</button></div></div>
-      <div class="folder"><span>Scannererkennung</span><div class="folder-row"><button class="secondary" disabled={!sessionReleased || cooldownRemaining > 0 || discoveryState === "searching"} on:click={detectScanners}>{discoveryState === "searching" ? "Suche läuft …" : "Scanner erkennen / erneut suchen"}</button><select aria-label="Erkannten Scanner auswählen" bind:value={device} on:change={() => confirmedDevice = ""} disabled={!sessionReleased || scanners.length === 0 || cooldownRemaining > 0}><option value="">Scanner auswählen</option>{#each scanners as scanner}<option value={scanner.id}>{scanner.displayName}</option>{/each}</select><button class="secondary" disabled={!device || confirmedDevice === device || !sessionReleased} on:click={() => confirmedDevice = device}>Scanner bestätigen</button></div><p class="hint">Die Erkennung wird nur auf ausdrücklichen Klick und im Leerlauf ausgeführt. Sie öffnet keinen Scan und bewegt den Filmhalter nicht.</p>{#if discoveryMessage}<p role="status">{discoveryMessage}</p>{/if}{#if device}<details><summary>Diagnosedaten</summary><code>{device}</code></details>{/if}{#if confirmedDevice}<p class="safe-note" role="status">Auswahl bestätigt: {scanners.find((scanner) => scanner.id === confirmedDevice)?.displayName ?? confirmedDevice}</p>{/if}</div>
+      <div class="folder"><span>Scannererkennung</span><div class="folder-row"><button class="secondary" disabled={!sessionReleased || cooldownRemaining > 0 || discoveryState === "searching"} on:click={detectScanners}>{discoveryState === "searching" ? "Suche läuft …" : "Scanner erkennen / erneut suchen"}</button><select aria-label="Erkannten Scanner auswählen" bind:value={device} on:change={scannerSelectionChanged} disabled={!sessionReleased || scanners.length === 0 || cooldownRemaining > 0}><option value="">Scanner auswählen</option>{#each scanners as scanner}<option value={scanner.id}>{scanner.displayName}</option>{/each}</select><button class="secondary" disabled={!device || confirmedDevice === device || !sessionReleased} on:click={confirmScannerSelection}>Scanner bestätigen</button></div><p class="hint">Die Erkennung wird nur auf ausdrücklichen Klick und im Leerlauf ausgeführt. Sie öffnet keinen Scan und bewegt den Filmhalter nicht.</p>{#if discoveryMessage}<p role="status">{discoveryMessage}</p>{/if}{#if device}<details><summary>Diagnosedaten</summary><code>{device}</code></details>{/if}{#if confirmedDevice}<p class="safe-note" role="status">Auswahl bestätigt: {scanners.find((scanner) => scanner.id === confirmedDevice)?.displayName ?? confirmedDevice}</p>{/if}</div>
       <p class="hint">Der Zielordner kann auf einer externen SSD liegen. Jeder manuelle Scan startet einen neuen Clientprozess und erhält einen eigenen kollisionsfreien Exportordner.</p>
-      {#if frame > 4}<p class="error-banner" role="status">Frames 5–6 sind im UI verfügbar, benötigen für reale Scans aber noch die separate Freigabe des neu gebauten Clienthashs. Die Simulation unterstützt beide Positionen.</p>{/if}
       {#if cooldownRemaining > 0}<p class="safe-note" role="status">Nächster realer Scan frühestens in {cooldownRemaining} Sekunden. Der Cooldown wird im Rust-Core erzwungen.</p>{/if}
 
       <div class="holder-guide" aria-live="polite">
@@ -186,7 +197,7 @@
       {#if projection.error}<p class="error-banner" role="alert">{projection.error}</p>{/if}
       {#if exportNotice}<p class="success-banner" role="status">{exportNotice}</p>{/if}
       <div class="gate" role="status"><strong>Hashgebundener Hardwarepfad · Einzelbildbetrieb.</strong><span>Erkennung, Auswahl, manuelle Halterbestätigung und erneuter Start sind getrennte Schritte. Keine automatischen Wiederholungen.</span></div>
-      <div class="actions"><button class="primary" disabled={!clientApproved || !outputFolder.trim() || !device.trim() || confirmedDevice !== device || projection.state !== "idle" || !sessionReleased || frame > 4 || cooldownRemaining > 0} on:click={startGuidedScan}>Realen Einzelbildscan starten</button><button class="secondary" disabled={!outputFolder.trim() || projection.state !== "idle" || !sessionReleased} on:click={startGuidedSimulation}>Ablauf hardwarefrei simulieren</button><button class="secondary" disabled={projection.state === "idle" || projection.state === "completed" || projection.state === "failed" || projection.state === "cancelled" || projection.state === "timedOut"} on:click={cancelGuidedScan}>Abbrechen</button>{#if ["completed", "failed", "cancelled", "timedOut"].includes(projection.state) && sessionReleased}<button class="secondary" on:click={prepareNextScan}>Nächsten Einzelbildscan vorbereiten</button>{/if}</div>
+      <div class="actions"><button class="primary" disabled={!clientApproved || !outputFolder.trim() || !device.trim() || confirmedDevice !== device || projection.state !== "idle" || !sessionReleased || cooldownRemaining > 0} on:click={startGuidedScan}>Realen Einzelbildscan starten</button><button class="secondary" disabled={!outputFolder.trim() || projection.state !== "idle" || !sessionReleased} on:click={startGuidedSimulation}>Ablauf hardwarefrei simulieren</button><button class="secondary" disabled={projection.state === "idle" || projection.state === "completed" || projection.state === "failed" || projection.state === "cancelled" || projection.state === "timedOut"} on:click={cancelGuidedScan}>Abbrechen</button>{#if ["completed", "failed", "cancelled", "timedOut"].includes(projection.state) && sessionReleased}<button class="secondary" on:click={prepareNextScan}>Nächsten Einzelbildscan vorbereiten</button>{/if}</div>
     </section>
 
     <aside class="card log-card"><div class="section-heading"><div><p class="step">DIAGNOSE</p><h2>Scannerereignisse</h2></div><span>{events.length}</span></div>

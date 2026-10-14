@@ -31,10 +31,39 @@ describe("App", () => {
     expect(await screen.findByText("Ein Scanner gefunden. Bitte auswählen und ausdrücklich bestätigen.")).toBeInTheDocument();
     await fireEvent.click(screen.getByRole("button", { name: "Scanner bestätigen" }));
     expect(start).toBeDisabled();
+    expect(screen.queryByText("Ein Scanner gefunden. Bitte auswählen und ausdrücklich bestätigen.")).not.toBeInTheDocument();
+    expect(screen.getByText(/Minolta DiMAGE Scan Dual II bestätigt/)).toBeInTheDocument();
     const dialog = await import("@tauri-apps/plugin-dialog");
     vi.mocked(dialog.open).mockResolvedValueOnce("/Volumes/Scan SSD/Film");
     await fireEvent.click(screen.getByRole("button", { name: "Ordner auswählen …" }));
     expect(start).toBeEnabled();
+  });
+
+  it("allows a manually selected and confirmed real single scan at frame 6", async () => {
+    const tauri = await import("@tauri-apps/api/core");
+    const dialog = await import("@tauri-apps/plugin-dialog");
+    vi.mocked(tauri.invoke).mockResolvedValueOnce({
+      state: "oneScanner",
+      devices: [{ id: "avision:usb:002:006", displayName: "Minolta DiMAGE Scan Dual II", vendor: "Minolta", model: "DiMAGE Scan Dual II", deviceType: "film scanner" }],
+    });
+    vi.mocked(dialog.open).mockResolvedValueOnce("/Volumes/Scan SSD/Film");
+    render(App);
+    await fireEvent.click(screen.getByRole("button", { name: "Scanner erkennen / erneut suchen" }));
+    await fireEvent.click(screen.getByRole("button", { name: "Scanner bestätigen" }));
+    await fireEvent.click(screen.getByRole("button", { name: "Ordner auswählen …" }));
+    await fireEvent.change(screen.getByLabelText("Filmposition"), { target: { value: "6" } });
+    const start = screen.getByRole("button", { name: "Realen Einzelbildscan starten" });
+    expect(start).toBeEnabled();
+    await fireEvent.click(start);
+    await waitFor(() => expect(tauri.invoke).toHaveBeenCalledWith("start_guided_scan", {
+      request: {
+        frame: 6,
+        dpi: 2820,
+        device: "avision:usb:002:006",
+        confirmedDevice: "avision:usb:002:006",
+        outputDirectory: "/Volumes/Scan SSD/Film",
+      },
+    }));
   });
 
   it("runs scanner discovery only after an explicit click and presents no/one/multiple results", async () => {

@@ -52,3 +52,25 @@ Die geänderte Arbeitskopie wurde für ARM64 mit der nativen Apple-Clang-/macOS-
 ## Status
 
 `BLOCKED` für die vollständige D5-Hardwarefreigabe: Die automatische Erkennung ist noch nicht an echter Hardware geprüft, und Positionen 5–6 benötigen eine getrennte Freigabe des neuen Clienthashs sowie die anschließende Paketierung. Die hardwarefreie D5-Implementierung selbst ist getestet; reale Scans und Scannererkennung wurden nicht ausgeführt.
+
+## D5-HW2 Addendum
+
+Dieses Addendum dokumentiert den nachfolgenden HW2-Integrationsauftrag; obige Abschnitte bewahren den historischen D5-Ausgangsstand.
+
+- **D5-HW1, Nutzerbericht:** Scanner „Minolta DiMAGE Scan Dual II“ wurde in der nativen GUI erkannt und ausgewählt; technische Kennung `avision:libusb:002:006`; kein Scan gestartet. Ergebnis laut Nutzer `PASS`.
+- **Client-Reprüfung:** Vor Integration erneut verifiziert: Kandidat SHA-256 `d591832bf08e09aaa2758634fa86f0c7138bb63fcb801350743637f58ce2e404`, thin ARM64 Mach-O, gültige Ad-hoc-Signatur, dynamische Referenz auf `/opt/homebrew/opt/sane-backends/lib/libsane.1.dylib`, CLI-Fehlermeldung bestätigt gültige Frames 1–6. Das Kandidatenprogramm wurde nicht ausgeführt.
+- **Integration:** Kandidat liegt unter dem festen Ressourcenpfad `src-tauri/sidecars/macos-aarch64/minolta-batch-frame`; der fixe Resolver-Trust-Anchor ist auf exakt denselben SHA-256 gesetzt. Es gibt keinen Hash-Fallback oder dynamisches Vertrauen. Der D4-Client wurde ersetzt.
+- **UI-Korrektur:** Erfolgreiche Gerätebestätigung zeigt nun einen Bestätigungsstatus statt der widersprüchlichen Aufforderung zur erneuten Auswahl. Die reale manuelle Einzelbildauswahl 1–6 ist freigegeben; Batch bleibt bei 1–4.
+- **Erhaltene Ablaufbedingungen:** Ein eigener Clientprozess pro Einzelbild, `OPENED` → manueller Klick → `HOLDER_DETECTED`, tatsächliche Parameter/EOF, Prozessabschluss und Reaping, Artefaktvalidierung/Export sowie Core-erzwungener Cooldown von 30 Sekunden. Keine automatische Wiederholung. Jeder nächste Lauf beginnt erneut mit dem bestehenden Holder-Handshake; Holder-Wiederverwendung wird nicht angenommen.
+- **Sicherheitsstatus:** App-/Codeintegration und hardwarefreie Tests bestanden. Der reale D5-Client wurde nicht gestartet; SANE-Geräteerkennung wurde in dieser Phase nicht erneut aufgerufen. `CaptureKind::Production` bleibt unverändert gesperrt. Erst nachdem der Nutzer den ersten D5-Scan separat genehmigt und ausgeführt hat, kann ein Hardware-PASS für den neuen Client behauptet werden.
+
+## D5-HW2 Abschluss
+
+- **Git:** Ausgangs-HEAD und Remote-Featurebranch stimmten auf `8ca4368ea8f8d417f942697125d10bc0730617de` überein; `origin/main` blieb `4d88b4cb5ed46ebc8d827e12fc4984f2d2d02fe4`. Kein Pull, Merge oder Reset wurde vorgenommen. `tools/minolta-hardware-test.sha256` blieb ungetrackt und unberührt.
+- **Fester Client:** `src-tauri/sidecars/macos-aarch64/minolta-batch-frame`, exact SHA-256 `d591832bf08e09aaa2758634fa86f0c7138bb63fcb801350743637f58ce2e404`; der Resolver vergleicht ausschließlich diesen fest eingetragenen Wert. Die integrierte Datei und die Datei im finalen App-Bundle stimmen bytegenau per SHA-256 überein.
+- **Framefreigabe:** reale Einzelbildscans der Positionen 1–6 werden von Request, CLI und UI akzeptiert. Batch bleibt 1–4; es gibt keine automatische Framefolge.
+- **Prüfungen:** Rust 114 bestanden, 0 fehlgeschlagen, 12 absichtlich ignorierte Harnessfälle; Prozess-E2E 2 bestanden; Frontendtests 17 bestanden; `cargo fmt --check`, Clippy `-D warnings`, TypeScript, Vite-Build und `git diff --check` bestanden. Der native `pnpm tauri build --bundles app` erstellte ein ARM64-Bundle.
+- **Paketprüfung:** Das Bundle enthält den D5-Client mit dem erwarteten Hash, thin ARM64-Architektur und gültiger Ad-hoc-Signatur. `otool -L` zeigt die erwartete installierte SANE-Bibliothek. Der Client wurde in dieser Phase nicht ausgeführt. Der zusätzliche strikte `codesign --verify`-Aufruf für das `.app`-Bundle meldet weiterhin `code has no resources but signature indicates they must be present`; das ist eine dokumentierte Bundle-Warnung, obwohl der Tauri-Build selbst erfolgreich ist.
+- **Regressionen:** Geräteerkennung ohne Autostart, No/One/Multiple-Zustände, ausdrückliche Auswahlbestätigung ohne widersprüchlichen Folgehinweis, alle Frames 1–6, fester Hash und Manipulationsablehnung sowie zwei getrennte Simulatorprozesse mit erneuter OPENED-/CONTINUE-Sequenz und separaten Capture-Exports sind abgedeckt.
+- **Nicht ausgeführt:** keine Scannererkennung durch Codex, kein Clientstart, kein Scan, keine SANE-Aufrufe durch Codex.
+- **Abschlussstatus:** `READY FOR D5-HW3 HARDWARE APPROVAL`. Vor einem realen Scan bleibt die ausdrückliche separate Hardwarefreigabe erforderlich. `CaptureKind::Production` bleibt gesperrt; erfolgreicher Lauf bedeutet daher nicht automatisch Produktionsklassifizierung.

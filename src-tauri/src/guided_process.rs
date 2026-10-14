@@ -342,12 +342,6 @@ fn ensure_approved_client_supports_frame(frame: u8) -> Result<(), String> {
     if !(1..=6).contains(&frame) {
         return Err("D5 unterstützt nur Filmpositionen 1–6".into());
     }
-    if frame > 4 {
-        return Err(
-            "Filmpositionen 5–6 benötigen den neu gebauten Client und dessen separate Hashfreigabe"
-                .into(),
-        );
-    }
     Ok(())
 }
 
@@ -875,7 +869,7 @@ mod tests {
     }
 
     #[test]
-    fn six_positions_are_valid_requests_but_five_and_six_remain_locked_to_the_unapproved_client() {
+    fn all_six_positions_are_valid_for_the_pinned_d5_client() {
         let root =
             std::env::temp_dir().join(format!("guided-frame-range-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
@@ -886,10 +880,14 @@ mod tests {
             confirmed_device: "scanner:explicit".into(),
             output_directory: root.clone(),
         };
-        assert!(validate_request(&candidate).is_ok());
-        assert!(ensure_approved_client_supports_frame(4).is_ok());
-        assert!(ensure_approved_client_supports_frame(5).is_err());
-        assert!(ensure_approved_client_supports_frame(6).is_err());
+        for frame in 1..=6 {
+            assert!(validate_request(&GuidedScanRequest {
+                frame,
+                ..candidate.clone()
+            })
+            .is_ok());
+            assert!(ensure_approved_client_supports_frame(frame).is_ok());
+        }
         candidate.frame = 0;
         assert!(validate_request(&candidate).is_err());
         candidate.frame = 7;

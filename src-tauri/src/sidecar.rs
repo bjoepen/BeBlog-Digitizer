@@ -24,11 +24,11 @@ pub(crate) fn trusted_arm64_test_sidecar() -> TrustedSha256 {
     TrustedSha256::from_bytes(ARM64_TEST_SIDECAR_SHA256)
 }
 
-/// Resolve only the independently approved D4 Minolta client binary.
+/// Resolve only the independently approved D5 Minolta client binary.
 pub(crate) fn resolve_approved_minolta_client(resource_dir: &Path) -> io::Result<ResolvedSidecar> {
-    // Explicit release approval for the exact ARM64 candidate reviewed in D4-HW1.
+    // Explicit release approval for the exact ARM64 candidate approved in D5-HW2.
     const APPROVED_MINOLTA_CLIENT_SHA256: &str =
-        "9049bb63b6a6a81ef1d686172f063d3949939e3acca7786fc3a414cb21d36aa6";
+        "d591832bf08e09aaa2758634fa86f0c7138bb63fcb801350743637f58ce2e404";
     let value = APPROVED_MINOLTA_CLIENT_SHA256;
     if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(io::Error::new(
@@ -557,7 +557,7 @@ mod tests {
         assert_eq!(resolved.path(), fs::canonicalize(&binary).unwrap());
         assert_eq!(
             format!("{:x}", Sha256::digest(fs::read(&binary).unwrap())),
-            "9049bb63b6a6a81ef1d686172f063d3949939e3acca7786fc3a414cb21d36aa6"
+            "d591832bf08e09aaa2758634fa86f0c7138bb63fcb801350743637f58ce2e404"
         );
         let actual_digest: [u8; 32] = Sha256::digest(fs::read(&binary).unwrap()).into();
         assert_eq!(resolved.sha256(), actual_digest);
