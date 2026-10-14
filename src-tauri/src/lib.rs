@@ -1,5 +1,6 @@
 mod adapter;
 pub mod archive;
+pub mod batch_plan;
 mod client_simulator;
 mod core;
 mod guided_process;

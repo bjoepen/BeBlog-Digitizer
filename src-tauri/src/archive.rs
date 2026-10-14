@@ -1,3 +1,4 @@
+use crate::batch_plan::{D6BatchManifest, D6BatchRequest, D6BatchStatus, D6FrameStatus};
 use crate::model::StartScanRequest;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -11,6 +12,7 @@ use std::{
 
 static CAPTURE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static BATCH_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static D6_BATCH_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const BATCH_ID_ATTEMPTS: usize = 16;
 
 fn legacy_capture_kind() -> CaptureKind {
@@ -125,6 +127,209 @@ impl ArchiveManager {
 
     pub(crate) fn root_path(&self) -> &Path {
         &self.root
+    }
+
+    /// Persist a D6 plan in its own schema and namespace. D1 journals remain in
+    /// `batches/` and retain their existing format and recovery behavior.
+    pub fn begin_d6_batch(&self, request: &D6BatchRequest) -> io::Result<D6BatchManifest> {
+        request.validate().map_err(invalid_data)?;
+        let directory = self.root.join("batches").join("d6");
+        fs::create_dir_all(&directory)?;
+        for _ in 0..BATCH_ID_ATTEMPTS {
+            let manifest = D6BatchManifest::planned(request);
+            let path = d6_batch_path(&directory, manifest.batch_id.as_str());
+            match write_new_d6_manifest(&path, &manifest) {
+                Ok(()) => return Ok(manifest),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "Eindeutige D6-Batch-ID nach mehreren Versuchen nicht verfügbar",
+        ))
+    }
+
+    /// Reserve the next frame and durably associate its unique capture ID before
+    /// artifact validation/finalization is allowed to mark that capture complete.
+    pub fn begin_d6_frame(
+        &self,
+        batch_id: &str,
+        frame: u8,
+        capture_id: &str,
+    ) -> io::Result<String> {
+        validate_archive_id(capture_id)?;
+        self.update_d6_manifest(batch_id, |manifest| {
+            if !matches!(
+                manifest.status,
+                D6BatchStatus::Planned | D6BatchStatus::Running
+            ) {
+                return Err(invalid_data("D6-Batch ist nicht mehr aktiv"));
+            }
+            let Some(index) = manifest
+                .frames
+                .iter()
+                .position(|entry| entry.frame == frame)
+            else {
+                return Err(invalid_data("Frame ist nicht Teil des D6-Batchplans"));
+            };
+            if manifest.frames[..index]
+                .iter()
+                .any(|entry| entry.status != D6FrameStatus::Completed)
+                || manifest.frames[index].status != D6FrameStatus::Planned
+            {
+                return Err(invalid_data(
+                    "D6-Frames müssen strikt der Reihe nach starten",
+                ));
+            }
+            if manifest
+                .frames
+                .iter()
+                .any(|entry| entry.capture_id.as_deref() == Some(capture_id))
+            {
+                return Err(invalid_data(
+                    "Capture-ID ist bereits einem D6-Frame zugeordnet",
+                ));
+            }
+            manifest.status = D6BatchStatus::Running;
+            manifest.frames[index].status = D6FrameStatus::Running;
+            manifest.frames[index].capture_id = Some(capture_id.to_string());
+            Ok(manifest.frames[index].frame_id.as_str().to_string())
+        })
+    }
+
+    /// Persist successful artifact validation and capture association before a
+    /// caller finalizes the archive capture. This method does not itself validate
+    /// files and is deliberately not connected to the D5 import path in D6-B1.
+    pub fn mark_d6_frame_validated(
+        &self,
+        batch_id: &str,
+        frame: u8,
+        capture_id: &str,
+    ) -> io::Result<()> {
+        self.update_d6_manifest(batch_id, |manifest| {
+            let entry = d6_frame_mut(manifest, frame)?;
+            if entry.status != D6FrameStatus::Running
+                || entry.capture_id.as_deref() != Some(capture_id)
+            {
+                return Err(invalid_data(
+                    "D6-Validierung benötigt den laufenden, zugeordneten Capture",
+                ));
+            }
+            entry.status = D6FrameStatus::Validated;
+            Ok(())
+        })
+    }
+
+    /// Journal completion is permitted only after the prior durable Validated
+    /// association. The future orchestrator must call this after archive
+    /// finalization succeeds; failures leave the capture and journal diagnosable.
+    pub fn complete_d6_frame(&self, batch_id: &str, frame: u8) -> io::Result<()> {
+        self.update_d6_manifest(batch_id, |manifest| {
+            let entry = d6_frame_mut(manifest, frame)?;
+            if entry.status != D6FrameStatus::Validated || entry.capture_id.is_none() {
+                return Err(invalid_data(
+                    "D6-Capture kann ohne persistierte Validierung nicht abgeschlossen werden",
+                ));
+            }
+            entry.status = D6FrameStatus::Completed;
+            if manifest
+                .frames
+                .iter()
+                .all(|frame| frame.status == D6FrameStatus::Completed)
+            {
+                manifest.status = D6BatchStatus::Completed;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn fail_d6_frame(
+        &self,
+        batch_id: &str,
+        frame: u8,
+        detail: impl Into<String>,
+    ) -> io::Result<()> {
+        let detail = detail.into();
+        self.update_d6_manifest(batch_id, |manifest| {
+            let entry = d6_frame_mut(manifest, frame)?;
+            if !matches!(
+                entry.status,
+                D6FrameStatus::Running | D6FrameStatus::Validated
+            ) {
+                return Err(invalid_data("Nur ein aktiver D6-Frame kann fehlschlagen"));
+            }
+            entry.status = D6FrameStatus::Failed;
+            entry.failure = Some(detail.clone());
+            manifest.status = D6BatchStatus::Failed;
+            manifest.failure = Some(detail);
+            Ok(())
+        })
+    }
+
+    pub fn cancel_d6_batch(
+        &self,
+        batch_id: &str,
+        active_frame: Option<u8>,
+        detail: impl Into<String>,
+    ) -> io::Result<()> {
+        let detail = detail.into();
+        self.update_d6_manifest(batch_id, |manifest| {
+            if active_frame.is_none()
+                && manifest.frames.iter().any(|entry| {
+                    matches!(
+                        entry.status,
+                        D6FrameStatus::Running | D6FrameStatus::Validated
+                    )
+                })
+            {
+                return Err(invalid_data(
+                    "Aktiver D6-Frame muss beim Abbruchjournal benannt werden",
+                ));
+            }
+            if let Some(frame) = active_frame {
+                let entry = d6_frame_mut(manifest, frame)?;
+                if !matches!(
+                    entry.status,
+                    D6FrameStatus::Running | D6FrameStatus::Validated
+                ) {
+                    return Err(invalid_data(
+                        "Nur ein aktiver D6-Frame kann abgebrochen werden",
+                    ));
+                }
+                entry.status = D6FrameStatus::Cancelled;
+                entry.failure = Some(detail.clone());
+            }
+            if !matches!(
+                manifest.status,
+                D6BatchStatus::Planned | D6BatchStatus::Running
+            ) {
+                return Err(invalid_data("D6-Batch ist bereits abgeschlossen"));
+            }
+            manifest.status = D6BatchStatus::Cancelled;
+            manifest.failure = Some(detail);
+            Ok(())
+        })
+    }
+
+    fn update_d6_manifest<T>(
+        &self,
+        batch_id: &str,
+        update: impl FnOnce(&mut D6BatchManifest) -> io::Result<T>,
+    ) -> io::Result<T> {
+        validate_archive_id(batch_id)?;
+        let directory = self.root.join("batches").join("d6");
+        let path = d6_batch_path(&directory, batch_id);
+        let mut manifest: D6BatchManifest = serde_json::from_slice(&fs::read(&path)?)?;
+        manifest.validate().map_err(invalid_data)?;
+        if manifest.batch_id.as_str() != batch_id {
+            return Err(invalid_data(
+                "D6-Journal-ID stimmt nicht mit dem Dateinamen überein",
+            ));
+        }
+        let result = update(&mut manifest)?;
+        write_d6_manifest(&path, &manifest)?;
+        Ok(result)
     }
 
     #[cfg(test)]
@@ -516,7 +721,7 @@ impl ArchiveManager {
         }
         let batches = self.root.join("batches");
         if batches.exists() {
-            for entry in fs::read_dir(batches)? {
+            for entry in fs::read_dir(&batches)? {
                 let path = entry?.path();
                 if path.extension().and_then(|s| s.to_str()) != Some("json") {
                     continue;
@@ -530,6 +735,53 @@ impl ArchiveManager {
                     recovered.push(manifest.batch_id);
                 }
             }
+        }
+        let d6_batches = batches.join("d6");
+        if let Ok(metadata) = fs::symlink_metadata(&d6_batches) {
+            if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+                return Err(invalid_data(
+                    "D6-Batchjournalpfad ist kein echtes Verzeichnis",
+                ));
+            }
+            for entry in fs::read_dir(&d6_batches)? {
+                let path = entry?.path();
+                if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                    continue;
+                }
+                let mut manifest: D6BatchManifest = serde_json::from_slice(&fs::read(&path)?)?;
+                manifest.validate().map_err(invalid_data)?;
+                if path.file_stem().and_then(|name| name.to_str())
+                    != Some(manifest.batch_id.as_str())
+                {
+                    return Err(invalid_data(
+                        "D6-Journal-ID stimmt nicht mit dem Dateinamen überein",
+                    ));
+                }
+                if matches!(
+                    manifest.status,
+                    D6BatchStatus::Planned | D6BatchStatus::Running
+                ) {
+                    manifest.status = D6BatchStatus::Interrupted;
+                    manifest.failure =
+                        Some("Application ended; D6 batch is never resumed automatically".into());
+                    for frame in &mut manifest.frames {
+                        if matches!(
+                            frame.status,
+                            D6FrameStatus::Running | D6FrameStatus::Validated
+                        ) {
+                            frame.status = D6FrameStatus::Interrupted;
+                            frame.failure =
+                                Some("Application ended before frame completion".into());
+                        }
+                    }
+                    write_d6_manifest(&path, &manifest)?;
+                    recovered.push(manifest.batch_id.as_str().to_string());
+                }
+            }
+        } else if d6_batches.exists() {
+            return Err(io::Error::other(
+                "D6-Batchjournalpfad konnte nicht untersucht werden",
+            ));
         }
         Ok(recovered)
     }
@@ -622,6 +874,41 @@ fn write_batch_manifest(path: &Path, manifest: &BatchManifest) -> io::Result<()>
     file.write_all(b"\n")?;
     file.sync_all()?;
     fs::rename(temp, path)
+}
+
+fn d6_batch_path(directory: &Path, batch_id: &str) -> PathBuf {
+    directory.join(format!("{batch_id}.json"))
+}
+
+fn write_new_d6_manifest(path: &Path, manifest: &D6BatchManifest) -> io::Result<()> {
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    serde_json::to_writer_pretty(&mut file, manifest).map_err(io::Error::other)?;
+    file.write_all(b"\n")?;
+    file.sync_all()
+}
+
+fn write_d6_manifest(path: &Path, manifest: &D6BatchManifest) -> io::Result<()> {
+    let sequence = D6_BATCH_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temporary = path.with_extension(format!("{}.{}.tmp", std::process::id(), sequence));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    serde_json::to_writer_pretty(&mut file, manifest).map_err(io::Error::other)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    fs::rename(temporary, path)
+}
+
+fn d6_frame_mut(
+    manifest: &mut D6BatchManifest,
+    frame: u8,
+) -> io::Result<&mut crate::batch_plan::D6FrameJournalEntry> {
+    manifest
+        .frames
+        .iter_mut()
+        .find(|entry| entry.frame == frame)
+        .ok_or_else(|| invalid_data("Frame ist nicht Teil des D6-Batchplans"))
 }
 
 fn write_original(
@@ -867,6 +1154,7 @@ fn validate_raw(bytes: &[u8], kind: CaptureKind) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::batch_plan::{D6BatchRequest, D6FrameStatus};
     use crate::model::SimulationMode;
 
     fn temp_root(label: &str) -> PathBuf {
@@ -1200,5 +1488,176 @@ mod tests {
         let old = r#"{"schemaVersion":1,"captureId":"legacy","status":"inProgress","frame":1,"pixelFormat":"RGB8","resolutionDpi":600,"expectedRawBytes":1438200,"files":[],"failure":null}"#;
         let manifest: CaptureManifest = serde_json::from_str(old).unwrap();
         assert_eq!(manifest.capture_kind, CaptureKind::UnclassifiedLegacy);
+    }
+
+    #[test]
+    fn d6_journal_requires_persisted_validation_before_frame_completion() {
+        let root = temp_root("d6-journal-contract");
+        let archive = ArchiveManager::new(root.clone());
+        let manifest = archive.begin_d6_batch(&D6BatchRequest::default()).unwrap();
+        let batch_id = manifest.batch_id.as_str();
+        assert_eq!(manifest.frames.len(), 4);
+        assert!(manifest
+            .frames
+            .iter()
+            .all(|entry| entry.status == D6FrameStatus::Planned));
+
+        let first_frame_id = archive
+            .begin_d6_frame(batch_id, 1, "capture-unique-1")
+            .unwrap();
+        assert!(first_frame_id.ends_with("-frame-1"));
+        assert!(archive.complete_d6_frame(batch_id, 1).is_err());
+        archive
+            .mark_d6_frame_validated(batch_id, 1, "capture-unique-1")
+            .unwrap();
+        archive.complete_d6_frame(batch_id, 1).unwrap();
+        assert!(archive
+            .begin_d6_frame(batch_id, 3, "capture-unique-3")
+            .is_err());
+        archive
+            .begin_d6_frame(batch_id, 2, "capture-unique-2")
+            .unwrap();
+
+        let persisted: D6BatchManifest = serde_json::from_slice(
+            &fs::read(d6_batch_path(&root.join("batches/d6"), batch_id)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            persisted.frames[0].capture_id.as_deref(),
+            Some("capture-unique-1")
+        );
+        assert_eq!(persisted.frames[0].status, D6FrameStatus::Completed);
+        assert_eq!(persisted.frames[1].status, D6FrameStatus::Running);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn d6_journal_update_failure_does_not_claim_frame_completion() {
+        let root = temp_root("d6-journal-write-failure");
+        let archive = ArchiveManager::new(root.clone());
+        let manifest = archive
+            .begin_d6_batch(&D6BatchRequest { frames: vec![1, 2] })
+            .unwrap();
+        let path = d6_batch_path(&root.join("batches/d6"), manifest.batch_id.as_str());
+        archive
+            .begin_d6_frame(manifest.batch_id.as_str(), 1, "capture-journal-error")
+            .unwrap();
+        archive
+            .mark_d6_frame_validated(manifest.batch_id.as_str(), 1, "capture-journal-error")
+            .unwrap();
+        fs::write(&path, b"damaged journal").unwrap();
+        assert!(archive
+            .complete_d6_frame(manifest.batch_id.as_str(), 1)
+            .is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"damaged journal");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn d6_terminal_frame_journal_states_are_explicit_and_ordered() {
+        let root = temp_root("d6-terminal-states");
+        let archive = ArchiveManager::new(root.clone());
+        let failed = archive
+            .begin_d6_batch(&D6BatchRequest { frames: vec![1, 2] })
+            .unwrap();
+        archive
+            .begin_d6_frame(failed.batch_id.as_str(), 1, "capture-fail")
+            .unwrap();
+        archive
+            .fail_d6_frame(failed.batch_id.as_str(), 1, "fixture failure")
+            .unwrap();
+        let failed_now: D6BatchManifest = serde_json::from_slice(
+            &fs::read(d6_batch_path(
+                &root.join("batches/d6"),
+                failed.batch_id.as_str(),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(failed_now.status, D6BatchStatus::Failed);
+        assert_eq!(failed_now.frames[0].status, D6FrameStatus::Failed);
+        assert_eq!(failed_now.frames[1].status, D6FrameStatus::Planned);
+
+        let cancelled = archive
+            .begin_d6_batch(&D6BatchRequest { frames: vec![1, 2] })
+            .unwrap();
+        archive
+            .begin_d6_frame(cancelled.batch_id.as_str(), 1, "capture-cancel")
+            .unwrap();
+        archive
+            .cancel_d6_batch(cancelled.batch_id.as_str(), Some(1), "fixture cancellation")
+            .unwrap();
+        let cancelled_now: D6BatchManifest = serde_json::from_slice(
+            &fs::read(d6_batch_path(
+                &root.join("batches/d6"),
+                cancelled.batch_id.as_str(),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cancelled_now.status, D6BatchStatus::Cancelled);
+        assert_eq!(cancelled_now.frames[0].status, D6FrameStatus::Cancelled);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn d6_batch_becomes_completed_only_after_every_ordered_frame_is_journaled() {
+        let root = temp_root("d6-batch-complete");
+        let archive = ArchiveManager::new(root.clone());
+        let manifest = archive
+            .begin_d6_batch(&D6BatchRequest { frames: vec![1, 2] })
+            .unwrap();
+        for frame in [1, 2] {
+            let capture_id = format!("capture-d6-{frame}");
+            archive
+                .begin_d6_frame(manifest.batch_id.as_str(), frame, &capture_id)
+                .unwrap();
+            archive
+                .mark_d6_frame_validated(manifest.batch_id.as_str(), frame, &capture_id)
+                .unwrap();
+            archive
+                .complete_d6_frame(manifest.batch_id.as_str(), frame)
+                .unwrap();
+            let persisted: D6BatchManifest = serde_json::from_slice(
+                &fs::read(d6_batch_path(
+                    &root.join("batches/d6"),
+                    manifest.batch_id.as_str(),
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                persisted.status,
+                if frame == 2 {
+                    D6BatchStatus::Completed
+                } else {
+                    D6BatchStatus::Running
+                }
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn d6_recovery_marks_in_progress_plan_interrupted_without_resuming() {
+        let root = temp_root("d6-recovery");
+        let archive = ArchiveManager::new(root.clone());
+        let manifest = archive
+            .begin_d6_batch(&D6BatchRequest { frames: vec![1, 2] })
+            .unwrap();
+        archive
+            .begin_d6_frame(manifest.batch_id.as_str(), 1, "capture-interrupted")
+            .unwrap();
+        assert_eq!(
+            archive.recover_incomplete().unwrap(),
+            vec![manifest.batch_id.as_str()]
+        );
+        let path = d6_batch_path(&root.join("batches/d6"), manifest.batch_id.as_str());
+        let recovered: D6BatchManifest = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(recovered.status, D6BatchStatus::Interrupted);
+        assert_eq!(recovered.frames[0].status, D6FrameStatus::Interrupted);
+        assert_eq!(recovered.frames[1].status, D6FrameStatus::Planned);
+        assert!(archive.recover_incomplete().unwrap().is_empty());
+        fs::remove_dir_all(root).unwrap();
     }
 }
