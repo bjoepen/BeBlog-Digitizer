@@ -184,3 +184,107 @@ fn repeated_single_frame_scans_use_separate_children_and_repeat_holder_handshake
     assert_eq!(captures, 2, "each process must archive a separate capture");
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn d6_simulated_batches_use_a_fresh_child_and_confirm_follow_frames_only_after_opened() {
+    let root = std::env::temp_dir().join(format!("beblog-d6-child-e2e-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&root).unwrap();
+
+    for count in [2_u8, 4, 6] {
+        let batch_root = root.join(format!("batch-{count}"));
+        let archive = ArchiveManager::new(batch_root.join("archive"));
+        let output_root = batch_root.join("output");
+        fs::create_dir_all(&output_root).unwrap();
+        for frame in 1..=count {
+            let work = batch_root.join(format!("work-{frame}"));
+            fs::create_dir_all(&work).unwrap();
+            let prefix = work.join("capture");
+            let frame_text = frame.to_string();
+            let mut child = Command::new(env!("CARGO_BIN_EXE_beblog-digitizer"))
+                .args([
+                    "--beblog-guided-simulator",
+                    "--prefix",
+                    prefix.to_str().unwrap(),
+                    "--frame",
+                    &frame_text,
+                    "--dpi",
+                    "600",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("D6 simulation starts a new harmless child for each frame");
+
+            let mut stdout = BufReader::new(child.stdout.take().unwrap());
+            let mut line = String::new();
+            assert!(stdout.read_line(&mut line).unwrap() > 0);
+            assert_eq!(line.trim_end(), "BEBLOG/1\tOPENED");
+            // Frame 1 models the explicit user action; subsequent processes
+            // exercise the D6 rule to continue only after their own OPENED.
+            if frame == 1 {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                assert!(child.try_wait().unwrap().is_none());
+            }
+            child
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(b"CONTINUE\n")
+                .unwrap();
+            child.stdin.as_mut().unwrap().flush().unwrap();
+
+            let mut events = vec![line.trim_end().to_owned()];
+            line.clear();
+            while stdout.read_line(&mut line).unwrap() != 0 {
+                events.push(line.trim_end().to_owned());
+                line.clear();
+            }
+            let mut stderr = String::new();
+            child
+                .stderr
+                .take()
+                .unwrap()
+                .read_to_string(&mut stderr)
+                .unwrap();
+            assert!(
+                child.wait().unwrap().success(),
+                "simulator failed: {stderr}"
+            );
+            assert!(events
+                .iter()
+                .any(|event| event == "BEBLOG/1\tHOLDER_DETECTED"));
+            assert!(events
+                .iter()
+                .any(|event| event == &format!("BEBLOG/1\tFRAME_POSITIONED\t{frame}")));
+            assert!(events.iter().any(|event| event == "BEBLOG/1\tEOF\t1438200"));
+            assert_eq!(
+                events.last().map(String::as_str),
+                Some("BEBLOG/1\tCOMPLETE")
+            );
+
+            let paths = OfflineArtifactPaths::from_fixed_output_directory(&work);
+            let imported = import_offline_artifacts(&archive, frame, &paths).unwrap();
+            assert_eq!(imported.manifest.frame, frame);
+            let exported = export_validated_artifacts(frame, &paths, &output_root).unwrap();
+            for name in [
+                "capture.raw",
+                "capture.tiff",
+                "capture.params.txt",
+                "capture.client.log",
+            ] {
+                assert_eq!(
+                    fs::read(exported.join(name)).unwrap(),
+                    fs::read(work.join(name)).unwrap()
+                );
+            }
+        }
+        let captures = fs::read_dir(batch_root.join("archive"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().is_dir() && entry.file_name() != ".staging")
+            .count();
+        assert_eq!(captures, usize::from(count));
+    }
+    fs::remove_dir_all(root).unwrap();
+}

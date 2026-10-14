@@ -5,9 +5,12 @@
 //! path, shell fragment, or argument vector is accepted from the frontend.
 
 use crate::{
-    archive::ArchiveManager,
+    archive::{ArchiveManager, PendingCapture},
     guided_protocol::{parse_client_line, ClientEvent, GuidedProtocol},
-    offline_import::{export_validated_artifacts, import_offline_artifacts, OfflineArtifactPaths},
+    offline_import::{
+        export_d6_validated_artifacts, export_validated_artifacts, import_offline_artifacts,
+        validate_d6_artifacts, OfflineArtifactPaths,
+    },
     sidecar::resolve_approved_minolta_client,
 };
 use serde::{Deserialize, Serialize};
@@ -41,6 +44,54 @@ pub(crate) struct GuidedScanRequest {
     pub device: String,
     pub confirmed_device: String,
     pub output_directory: PathBuf,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct D6BatchScanRequest {
+    #[serde(default = "default_d6_frames")]
+    pub frames: Vec<u8>,
+    pub dpi: u16,
+    pub device: String,
+    pub confirmed_device: String,
+    pub output_directory: PathBuf,
+}
+
+fn default_d6_frames() -> Vec<u8> {
+    crate::batch_plan::D6BatchRequest::default().frames
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum D6BatchPhase {
+    Starting,
+    AwaitingHolderConfirmation,
+    WaitingForHolderDetection,
+    Scanning,
+    InterFrameCooldown,
+    Cancelling,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct D6BatchUiEvent {
+    pub batch_id: String,
+    pub phase: D6BatchPhase,
+    pub current_frame: Option<u8>,
+    pub completed_frames: u8,
+    pub total_frames: u8,
+    pub cooldown_remaining_seconds: u8,
+    pub awaiting_holder_confirmation: bool,
+    pub scanner_lease_retained: bool,
+    pub message: String,
+}
+
+struct D6CaptureContext {
+    batch_id: String,
+    pending: PendingCapture,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -127,7 +178,9 @@ enum ControlMessage {
 
 impl GuidedProcessController {
     #[allow(clippy::too_many_arguments)] // Explicit dependencies keep the fixed process contract auditable.
-    pub(crate) fn start(
+    /// Starts exactly one D5 frame. The caller must already own the AppCore
+    /// scanner lease; D6 will reuse this same entry point under its batch lease.
+    pub(crate) fn start_single_frame(
         &self,
         app: AppHandle,
         resource_dir: PathBuf,
@@ -135,7 +188,7 @@ impl GuidedProcessController {
         archive: ArchiveManager,
         request: GuidedScanRequest,
         cancelled: Arc<AtomicBool>,
-        on_finished: impl FnOnce(bool) + Send + 'static,
+        on_finished: impl FnOnce(Result<(), String>, bool) + Send + 'static,
     ) -> Result<String, String> {
         validate_request(&request)?;
         ensure_approved_client_supports_frame(request.frame)?;
@@ -155,6 +208,9 @@ impl GuidedProcessController {
             archive,
             cancelled,
             true,
+            false,
+            None,
+            None,
             on_finished,
         )
     }
@@ -166,7 +222,7 @@ impl GuidedProcessController {
         archive: ArchiveManager,
         request: GuidedScanRequest,
         cancelled: Arc<AtomicBool>,
-        on_finished: impl FnOnce(bool) + Send + 'static,
+        on_finished: impl FnOnce(Result<(), String>, bool) + Send + 'static,
     ) -> Result<String, String> {
         validate_request(&request)?;
         if request.device != "simulator:hardware-free" {
@@ -196,14 +252,109 @@ impl GuidedProcessController {
             archive,
             cancelled,
             false,
+            false,
+            None,
+            None,
+            on_finished,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn start_d6_single_frame<R: tauri::Runtime + 'static>(
+        &self,
+        app: AppHandle<R>,
+        resource_dir: PathBuf,
+        work_root: PathBuf,
+        archive: ArchiveManager,
+        request: GuidedScanRequest,
+        batch_id: String,
+        pending: PendingCapture,
+        cancelled: Arc<AtomicBool>,
+        auto_continue_after_opened: bool,
+        on_client_event: impl Fn(ClientEvent) + Send + Sync + 'static,
+        on_finished: impl FnOnce(Result<(), String>, bool) + Send + 'static,
+    ) -> Result<String, String> {
+        validate_request(&request)?;
+        let client =
+            resolve_approved_minolta_client(&resource_dir).map_err(|error| error.to_string())?;
+        let work_directory =
+            reserve_work_directory(&work_root).map_err(|error| error.to_string())?;
+        let prefix = work_directory.join("capture");
+        self.launch(
+            app,
+            client.path().to_path_buf(),
+            client_arguments(&request, &prefix),
+            work_directory,
+            request,
+            archive,
+            cancelled,
+            true,
+            auto_continue_after_opened,
+            Some(D6CaptureContext { batch_id, pending }),
+            Some(Arc::new(on_client_event)),
+            on_finished,
+        )
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)] // Mirrors the D5 worker contract for hardware-free D6 orchestration tests.
+    pub(crate) fn start_d6_simulated_single_frame<R: tauri::Runtime + 'static>(
+        &self,
+        app: AppHandle<R>,
+        work_root: PathBuf,
+        archive: ArchiveManager,
+        request: GuidedScanRequest,
+        batch_id: String,
+        pending: PendingCapture,
+        cancelled: Arc<AtomicBool>,
+        auto_continue_after_opened: bool,
+        on_client_event: impl Fn(ClientEvent) + Send + Sync + 'static,
+        on_finished: impl FnOnce(Result<(), String>, bool) + Send + 'static,
+    ) -> Result<String, String> {
+        validate_request(&request)?;
+        let work_directory =
+            reserve_work_directory(&work_root).map_err(|error| error.to_string())?;
+        let executable = std::env::current_exe()
+            .map_err(|error| format!("Test-Runnerpfad nicht verfügbar: {error}"))?
+            .parent()
+            .and_then(Path::parent)
+            .ok_or("Test-App-Binarypfad nicht verfügbar")?
+            .join("beblog-digitizer");
+        if !executable.is_file() {
+            return Err(format!(
+                "Hardwarefreies Simulatorprogramm fehlt: {}",
+                executable.display()
+            ));
+        }
+        let arguments = vec![
+            OsString::from("--beblog-guided-simulator"),
+            OsString::from("--prefix"),
+            work_directory.join("capture").into_os_string(),
+            OsString::from("--frame"),
+            OsString::from(request.frame.to_string()),
+            OsString::from("--dpi"),
+            OsString::from(request.dpi.to_string()),
+        ];
+        self.launch(
+            app,
+            executable,
+            arguments,
+            work_directory,
+            request,
+            archive,
+            cancelled,
+            false,
+            auto_continue_after_opened,
+            Some(D6CaptureContext { batch_id, pending }),
+            Some(Arc::new(on_client_event)),
             on_finished,
         )
     }
 
     #[allow(clippy::too_many_arguments)] // Mirrors the bounded worker inputs, none originate as executable/UI paths.
-    fn launch(
+    fn launch<R: tauri::Runtime + 'static>(
         &self,
-        app: AppHandle,
+        app: AppHandle<R>,
         executable: PathBuf,
         arguments: Vec<OsString>,
         work_directory: PathBuf,
@@ -211,7 +362,10 @@ impl GuidedProcessController {
         archive: ArchiveManager,
         cancelled: Arc<AtomicBool>,
         real_scan: bool,
-        on_finished: impl FnOnce(bool) + Send + 'static,
+        auto_continue_after_opened: bool,
+        d6_capture: Option<D6CaptureContext>,
+        on_client_event: Option<Arc<dyn Fn(ClientEvent) + Send + Sync>>,
+        on_finished: impl FnOnce(Result<(), String>, bool) + Send + 'static,
     ) -> Result<String, String> {
         let run_id = uuid::Uuid::new_v4().to_string();
         let opened = Arc::new(AtomicBool::new(false));
@@ -236,6 +390,8 @@ impl GuidedProcessController {
         let active = self.active.clone();
         let cooldown_until = self.cooldown_until.clone();
         let worker_run_id = run_id.clone();
+        let cleanup_confirmed = Arc::new(AtomicBool::new(true));
+        let worker_cleanup_confirmed = cleanup_confirmed.clone();
         thread::spawn(move || {
             let result = run_client(
                 app.clone(),
@@ -247,6 +403,11 @@ impl GuidedProcessController {
                 opened,
                 cancelled,
                 control_rx,
+                worker_cleanup_confirmed.clone(),
+                auto_continue_after_opened,
+                confirmation_sent,
+                on_client_event,
+                d6_capture,
             );
             if real_scan {
                 let until = Instant::now() + REAL_SCAN_COOLDOWN;
@@ -260,20 +421,37 @@ impl GuidedProcessController {
                     },
                 );
             }
-            let succeeded = result.is_ok();
-            if let Err(error) = result {
-                emit(&app, GuidedUiEvent::ProcessFailed { detail: error });
+            let safe_to_release = worker_cleanup_confirmed.load(Ordering::SeqCst);
+            if let Err(error) = &result {
+                emit(
+                    &app,
+                    GuidedUiEvent::ProcessFailed {
+                        detail: error.clone(),
+                    },
+                );
             }
-            on_finished(succeeded);
-            if let Ok(mut active) = active.lock() {
-                if active
-                    .as_ref()
-                    .is_some_and(|session| session.run_id == worker_run_id)
-                {
-                    *active = None;
+            if safe_to_release {
+                if let Ok(mut active) = active.lock() {
+                    if active
+                        .as_ref()
+                        .is_some_and(|session| session.run_id == worker_run_id)
+                    {
+                        *active = None;
+                    }
                 }
             }
-            emit(&app, GuidedUiEvent::SessionReleased);
+            on_finished(result, safe_to_release);
+            if safe_to_release {
+                emit(&app, GuidedUiEvent::SessionReleased);
+            } else {
+                emit(
+                    &app,
+                    GuidedUiEvent::Diagnostic {
+                        stream: "process",
+                        message: "Scanner-Lease bleibt gesperrt: Prozess-Cleanup nicht vollständig nachgewiesen".into(),
+                    },
+                );
+            }
         });
         Ok(run_id)
     }
@@ -345,7 +523,7 @@ fn ensure_approved_client_supports_frame(frame: u8) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_request(request: &GuidedScanRequest) -> Result<(), String> {
+pub(crate) fn validate_request(request: &GuidedScanRequest) -> Result<(), String> {
     if !(1..=6).contains(&request.frame) {
         return Err("D5 unterstützt Filmpositionen 1–6".into());
     }
@@ -419,8 +597,8 @@ enum ReaderMessage {
 }
 
 #[allow(clippy::too_many_arguments)] // Keeps AppHandle event delivery and each owned lifecycle resource explicit.
-fn run_client(
-    app: AppHandle,
+fn run_client<R: tauri::Runtime + 'static>(
+    app: AppHandle<R>,
     executable: PathBuf,
     arguments: Vec<OsString>,
     work_directory: PathBuf,
@@ -429,6 +607,11 @@ fn run_client(
     opened: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
     controls: Receiver<ControlMessage>,
+    cleanup_confirmed: Arc<AtomicBool>,
+    auto_continue_after_opened: bool,
+    confirmation_sent: Arc<AtomicBool>,
+    on_client_event: Option<Arc<dyn Fn(ClientEvent) + Send + Sync>>,
+    d6_capture: Option<D6CaptureContext>,
 ) -> Result<(), String> {
     if cancelled.load(Ordering::SeqCst) {
         emit(&app, GuidedUiEvent::ProcessCancelled);
@@ -444,6 +627,7 @@ fn run_client(
     let mut child = command
         .spawn()
         .map_err(|error| format!("Minolta-Client konnte nicht gestartet werden: {error}"))?;
+    cleanup_confirmed.store(false, Ordering::SeqCst);
     let pid = child.id();
     let mut stdin = child.stdin.take().ok_or("stdin-Handshakekanal fehlt")?;
     let stdout = child.stdout.take().ok_or("stdout-Ereigniskanal fehlt")?;
@@ -548,7 +732,30 @@ fn run_client(
                                 if event == ClientEvent::Opened {
                                     opened.store(true, Ordering::SeqCst);
                                 }
+                                if let Some(callback) = &on_client_event {
+                                    callback(event.clone());
+                                }
                                 emit_client_event(&app, event);
+                                if auto_continue_after_opened
+                                    && protocol.state()
+                                        == crate::model::ScanState::AwaitingHolderConfirmation
+                                {
+                                    if confirmation_sent.swap(true, Ordering::SeqCst) {
+                                        terminal_error = Some(
+                                            "Automatische CONTINUE-Freigabe wurde doppelt angefordert".into(),
+                                        );
+                                        cancelled.store(true, Ordering::SeqCst);
+                                    } else if let Err(error) = send_continue_after_opened(
+                                        &mut protocol,
+                                        opened.load(Ordering::SeqCst),
+                                        &mut stdin,
+                                    ) {
+                                        terminal_error = Some(error);
+                                        cancelled.store(true, Ordering::SeqCst);
+                                    } else {
+                                        emit(&app, GuidedUiEvent::HolderConfirmationAccepted);
+                                    }
+                                }
                             }
                         }
                         Err(error) => {
@@ -607,6 +814,9 @@ fn run_client(
                 protocol
                     .observe(event.clone())
                     .map_err(|error| format!("Zustandsfehler nach Exit: {error:?}"))?;
+                if let Some(callback) = &on_client_event {
+                    callback(event.clone());
+                }
                 emit_client_event(&app, event);
             }
             Ok(ReaderMessage::Line(false, line)) => emit(
@@ -635,6 +845,7 @@ fn run_client(
     if !stdout_closed || !stderr_closed {
         return Err("stdout/stderr wurden nicht vollständig geschlossen".into());
     }
+    cleanup_confirmed.store(true, Ordering::SeqCst);
     emit(&app, GuidedUiEvent::ProcessCleaned);
     if let Some(error) = terminal_error {
         return Err(error);
@@ -646,6 +857,33 @@ fn run_client(
         return Err("Clientprozess endete ohne vollständige BEBLOG/1-Completionsequenz".into());
     }
     let paths = OfflineArtifactPaths::from_fixed_output_directory(&work_directory);
+    if let Some(context) = d6_capture {
+        let receipt = validate_d6_artifacts(request.frame, &context.pending.id, &paths)
+            .map_err(|error| format!("D6-Artefaktvalidierung fehlgeschlagen: {error}"))?;
+        archive
+            .mark_d6_frame_validated(&context.batch_id, &receipt)
+            .map_err(|error| {
+                format!("D6-Validierungsjournal konnte nicht gespeichert werden: {error}")
+            })?;
+        let manifest = archive
+            .finalize_d6_capture(&context.batch_id, &context.pending, &receipt)
+            .map_err(|error| format!("D6-Capturefinalisierung fehlgeschlagen: {error}"))?;
+        let export = export_d6_validated_artifacts(&receipt, &request.output_directory)
+            .map_err(|error| format!("D6-Export fehlgeschlagen: {error}"))?;
+        archive
+            .complete_d6_frame(&context.batch_id, request.frame)
+            .map_err(|error| {
+                format!("D6-Abschlussjournal konnte nicht gespeichert werden: {error}")
+            })?;
+        emit(
+            &app,
+            GuidedUiEvent::ArtifactsExported {
+                directory: export.display().to_string(),
+                capture_id: manifest.capture_id,
+            },
+        );
+        return Ok(());
+    }
     let report = import_offline_artifacts(&archive, request.frame, &paths)
         .map_err(|error| format!("Artefaktvalidierung/Archivierung fehlgeschlagen: {error}"))?;
     let export = export_validated_artifacts(request.frame, &paths, &request.output_directory)
@@ -773,7 +1011,7 @@ fn is_no_such_process(error: &io::Error) -> bool {
     error.raw_os_error() == Some(libc::ESRCH)
 }
 
-fn emit_client_event(app: &AppHandle, event: ClientEvent) {
+fn emit_client_event<R: tauri::Runtime>(app: &AppHandle<R>, event: ClientEvent) {
     let value = match event {
         ClientEvent::Opened => GuidedUiEvent::Opened,
         ClientEvent::OpenFailed => GuidedUiEvent::OpenFailed {
@@ -820,7 +1058,7 @@ fn emit_client_event(app: &AppHandle, event: ClientEvent) {
     emit(app, value);
 }
 
-fn emit(app: &AppHandle, event: GuidedUiEvent) {
+fn emit<R: tauri::Runtime>(app: &AppHandle<R>, event: GuidedUiEvent) {
     let _ = app.emit("hardware-client-event", event);
 }
 

@@ -5,6 +5,8 @@
   import { onMount } from "svelte";
   import { confirmHolderInsertion, initialGuidedProjection, projectHardwareEvent, type HardwareClientEvent } from "./lib/guided";
 
+  type D6BatchEvent = { batchId: string; phase: string; currentFrame: number | null; completedFrames: number; totalFrames: number; cooldownRemainingSeconds: number; awaitingHolderConfirmation: boolean; scannerLeaseRetained: boolean; message: string };
+
   let projection = initialGuidedProjection;
   let frame = 1;
   let dpi = 2820;
@@ -20,6 +22,9 @@
   let exportNotice = "";
   let simulationMode = false;
   let events: { label: string; detail: string; error?: boolean }[] = [];
+  let batchSize = 4;
+  let d6Batch: D6BatchEvent | null = null;
+  let d6BatchActive = false;
   const clientApproved = true;
   const stateNames: Record<string, string> = {
     idle: "Bereit", openingScanner: "Scanner wird initialisiert", awaitingHolderConfirmation: "Verbindung bestätigt",
@@ -35,11 +40,23 @@
     void listen<HardwareClientEvent>("hardware-client-event", ({ payload }) => {
       projection = projectHardwareEvent(projection, payload);
       if (payload.kind === "scanCooldownStarted") startCooldownPolling(payload.seconds);
-      if (payload.kind === "sessionReleased") sessionReleased = true;
+      if (payload.kind === "sessionReleased" && !d6BatchActive) sessionReleased = true;
       events = [...events.slice(-99), { label: payload.kind === "holderConfirmationAccepted" ? "Benutzerbestätigung" : payload.kind, detail: payload.kind === "holderConfirmationAccepted" ? "Einsetzen durch Benutzer bestätigt; Haltererkennung folgt getrennt." : payload.kind === "dataChunk" ? `${payload.totalBytes.toLocaleString("de-DE")} Byte übertragen` : payload.kind === "error" || payload.kind === "openFailed" || payload.kind === "processFailed" ? payload.detail : payload.kind === "diagnostic" ? `[${payload.stream}] ${payload.message}` : payload.kind === "artifactsExported" ? payload.directory : payload.kind === "processExited" ? `OS-Exitcode ${payload.exitCode}` : payload.kind }];
       if (payload.kind === "artifactsExported") exportNotice = `Validierte Dateien exportiert: ${payload.directory}`;
     }).then((fn) => { if (disposed) fn(); else unlisten = fn; });
-    return () => { disposed = true; unlisten?.(); if (cooldownTimer) clearInterval(cooldownTimer); };
+    let unlistenBatch: UnlistenFn | undefined;
+    void listen<D6BatchEvent>("d6-batch-event", ({ payload }) => {
+      d6Batch = payload;
+      const terminal = ["completed", "failed", "cancelled"].includes(payload.phase);
+      d6BatchActive = !terminal || payload.scannerLeaseRetained;
+      if (terminal && !payload.scannerLeaseRetained) sessionReleased = true;
+      events = [...events.slice(-99), {
+        label: `D6 ${payload.phase} · Frame ${payload.currentFrame ?? "—"}/${payload.totalFrames}`,
+        detail: payload.message,
+        error: payload.phase === "failed"
+      }];
+    }).then((fn) => { if (disposed) fn(); else unlistenBatch = fn; });
+    return () => { disposed = true; unlisten?.(); unlistenBatch?.(); if (cooldownTimer) clearInterval(cooldownTimer); };
   });
 
   async function refreshCooldown() {
@@ -102,6 +119,11 @@
   }
 
   async function confirmInserted() {
+    if (d6BatchActive) {
+      try { await invoke("confirm_d6_batch_holder"); }
+      catch (error) { events = [...events, { label: "Batchbestätigung abgelehnt", detail: String(error), error: true }]; }
+      return;
+    }
     const confirmedProjection = confirmHolderInsertion(projection);
     if (confirmedProjection.state !== "waitingForHolderDetection") return;
     try {
@@ -146,6 +168,28 @@
     catch (error) { events = [...events, { label: "Abbruch nicht möglich", detail: String(error), error: true }]; }
   }
 
+  async function startD6Batch() {
+    if (d6BatchActive || !outputFolder.trim() || !device.trim() || confirmedDevice !== device || cooldownRemaining > 0 || !sessionReleased) return;
+    simulationMode = false;
+    d6BatchActive = true;
+    sessionReleased = false;
+    projection = { ...initialGuidedProjection, state: "openingScanner" };
+    d6Batch = null;
+    try {
+      const frames = Array.from({ length: batchSize }, (_, index) => index + 1);
+      await invoke<string>("start_d6_batch", { request: { frames, dpi, device, confirmedDevice, outputDirectory: outputFolder } });
+    } catch (error) {
+      d6BatchActive = false;
+      sessionReleased = true;
+      events = [...events, { label: "D6-Batchstart gesperrt", detail: String(error), error: true }];
+    }
+  }
+
+  async function cancelD6Batch() {
+    try { await invoke("cancel_d6_batch"); }
+    catch (error) { events = [...events, { label: "Batchabbruch nicht möglich", detail: String(error), error: true }]; }
+  }
+
   async function chooseFolder() {
     const selected = await open({ directory: true, multiple: false, title: "Scan-Ausgabeordner auswählen" });
     if (typeof selected === "string") outputFolder = selected;
@@ -178,9 +222,26 @@
 
       <div class="folder"><span>Ausgabeordner</span><div class="folder-row"><input aria-label="Ausgabeordner" type="text" readonly placeholder="Noch kein Ordner ausgewählt" bind:value={outputFolder} /><button class="secondary" on:click={chooseFolder}>Ordner auswählen …</button></div></div>
       <div class="folder"><span>Scannererkennung</span><div class="folder-row"><button class="secondary" disabled={!sessionReleased || cooldownRemaining > 0 || discoveryState === "searching"} on:click={detectScanners}>{discoveryState === "searching" ? "Suche läuft …" : "Scanner erkennen / erneut suchen"}</button><select aria-label="Erkannten Scanner auswählen" bind:value={device} on:change={scannerSelectionChanged} disabled={!sessionReleased || scanners.length === 0 || cooldownRemaining > 0}><option value="">Scanner auswählen</option>{#each scanners as scanner}<option value={scanner.id}>{scanner.displayName}</option>{/each}</select><button class="secondary" disabled={!device || confirmedDevice === device || !sessionReleased} on:click={confirmScannerSelection}>Scanner bestätigen</button></div><p class="hint">Die Erkennung wird nur auf ausdrücklichen Klick und im Leerlauf ausgeführt. Sie öffnet keinen Scan und bewegt den Filmhalter nicht.</p>{#if discoveryMessage}<p role="status">{discoveryMessage}</p>{/if}{#if device}<details><summary>Diagnosedaten</summary><code>{device}</code></details>{/if}{#if confirmedDevice}<p class="safe-note" role="status">Auswahl bestätigt: {scanners.find((scanner) => scanner.id === confirmedDevice)?.displayName ?? confirmedDevice}</p>{/if}</div>
+      <div class="folder d6-panel"><span>Geführter Mehrbildscan · D6</span><div class="folder-row"><label>Anzahl Bilder<select bind:value={batchSize} disabled={d6BatchActive}>{#each [2,3,4,5,6] as count}<option value={count}>{count} Bilder · Frames 1–{count}</option>{/each}</select></label><button class="primary" disabled={d6BatchActive || !outputFolder.trim() || !device.trim() || confirmedDevice !== device || !sessionReleased || cooldownRemaining > 0} on:click={startD6Batch}>Batch mit {batchSize} Bildern starten</button></div>
+        <p class="hint">Standardmäßig vier Bilder. Jeder Frame erhält einen eigenen D5-Clientprozess; der Halter bleibt eingesetzt, wird pro Prozess erneut erkannt und zwischen erfolgreichen Frames gilt der 30-Sekunden-Cooldown.</p>
+        {#if d6Batch}<div class="batch-progress" role="status"><strong>{d6Batch.currentFrame ? `Frame ${d6Batch.currentFrame} von ${d6Batch.totalFrames}` : `${d6Batch.totalFrames} Frames geplant`}</strong><span>{d6Batch.message}</span><progress max={d6Batch.totalFrames} value={d6Batch.completedFrames}></progress>{#if d6Batch.cooldownRemainingSeconds > 0}<span>Bereitschaftspause: {d6Batch.cooldownRemainingSeconds} Sekunden</span>{/if}{#if d6Batch.scannerLeaseRetained}<span class="error-banner">Prozess-Cleanup ungeklärt; Scanner bleibt gesperrt.</span>{/if}</div>{/if}
+      </div>
       <p class="hint">Der Zielordner kann auf einer externen SSD liegen. Jeder manuelle Scan startet einen neuen Clientprozess und erhält einen eigenen kollisionsfreien Exportordner.</p>
       {#if cooldownRemaining > 0}<p class="safe-note" role="status">Nächster realer Scan frühestens in {cooldownRemaining} Sekunden. Der Cooldown wird im Rust-Core erzwungen.</p>{/if}
 
+      {#if d6BatchActive}
+        <div class="holder-guide" aria-live="polite">
+          <p><strong>D6-Batch · Frame {d6Batch?.currentFrame ?? 1} von {d6Batch?.totalFrames ?? batchSize}</strong> Der bestehende D5-Einzelframe-Prozess wird für jeden Frame neu gestartet.</p>
+          {#if d6Batch?.awaitingHolderConfirmation}
+            <p class="prompt"><strong>Filmhalter jetzt einsetzen.</strong> Das echte <code>OPENED</code>-Ereignis ist eingetroffen. Nach Bestätigung wird die tatsächliche Haltererkennung abgewartet.</p>
+            <button class="primary" on:click={confirmInserted}>Filmhalter eingesetzt bestätigen</button>
+          {:else if d6Batch?.phase === "interFrameCooldown"}
+            <p><strong>Bereitschaftspause.</strong> Der nächste Prozess startet nach Ablauf des Rust-gesteuerten Countdowns.</p>
+          {:else}
+            <p>Der Filmhalter bleibt eingesetzt. Folgeframes werden erst nach neuem Prozessstart, <code>OPENED</code>, automatischem <code>CONTINUE</code> und tatsächlicher <code>HOLDER_DETECTED</code>-Rückmeldung fortgesetzt.</p>
+          {/if}
+        </div>
+      {:else}
       <div class="holder-guide" aria-live="polite">
         <p><strong>1 · {simulationMode ? "Simulator vorbereiten." : "Scanner vorbereiten."}</strong> {simulationMode ? "Der Testprozess erzeugt ausschließlich synthetische Dateien." : "Filmhalter herausnehmen, Klappe schließen und Scanner einschalten."}</p>
         <p><strong>2 · Verbindung aufbauen.</strong> Die App wartet auf das {simulationMode ? "simulierte " : "bestätigte "}<code>OPENED</code>-Ereignis.</p>
@@ -193,11 +254,12 @@
           <p><strong>3 · Halteraufforderung folgt nach Verbindung.</strong> Die UI zeigt diesen Schritt erst nach einem echten Clientereignis.</p>
         {/if}
       </div>
+      {/if}
 
       {#if projection.error}<p class="error-banner" role="alert">{projection.error}</p>{/if}
       {#if exportNotice}<p class="success-banner" role="status">{exportNotice}</p>{/if}
-      <div class="gate" role="status"><strong>Hashgebundener Hardwarepfad · Einzelbildbetrieb.</strong><span>Erkennung, Auswahl, manuelle Halterbestätigung und erneuter Start sind getrennte Schritte. Keine automatischen Wiederholungen.</span></div>
-      <div class="actions"><button class="primary" disabled={!clientApproved || !outputFolder.trim() || !device.trim() || confirmedDevice !== device || projection.state !== "idle" || !sessionReleased || cooldownRemaining > 0} on:click={startGuidedScan}>Realen Einzelbildscan starten</button><button class="secondary" disabled={!outputFolder.trim() || projection.state !== "idle" || !sessionReleased} on:click={startGuidedSimulation}>Ablauf hardwarefrei simulieren</button><button class="secondary" disabled={projection.state === "idle" || projection.state === "completed" || projection.state === "failed" || projection.state === "cancelled" || projection.state === "timedOut"} on:click={cancelGuidedScan}>Abbrechen</button>{#if ["completed", "failed", "cancelled", "timedOut"].includes(projection.state) && sessionReleased}<button class="secondary" on:click={prepareNextScan}>Nächsten Einzelbildscan vorbereiten</button>{/if}</div>
+      <div class="gate" role="status"><strong>Hashgebundener Hardwarepfad · Einzelbild- und D6-Batchbetrieb.</strong><span>Keine automatischen Wiederholungen; Folgeframes ausschließlich nach Prozesscleanup und Cooldown.</span></div>
+      <div class="actions"><button class="primary" disabled={d6BatchActive || !clientApproved || !outputFolder.trim() || !device.trim() || confirmedDevice !== device || projection.state !== "idle" || !sessionReleased || cooldownRemaining > 0} on:click={startGuidedScan}>Realen Einzelbildscan starten</button><button class="secondary" disabled={d6BatchActive || !outputFolder.trim() || projection.state !== "idle" || !sessionReleased} on:click={startGuidedSimulation}>Ablauf hardwarefrei simulieren</button><button class="secondary" disabled={d6BatchActive || projection.state === "idle" || projection.state === "completed" || projection.state === "failed" || projection.state === "cancelled" || projection.state === "timedOut"} on:click={cancelGuidedScan}>Einzelbildscan abbrechen</button>{#if d6BatchActive}<button class="secondary" on:click={cancelD6Batch}>D6-Batch abbrechen</button>{/if}{#if ["completed", "failed", "cancelled", "timedOut"].includes(projection.state) && sessionReleased && !d6BatchActive}<button class="secondary" on:click={prepareNextScan}>Nächsten Einzelbildscan vorbereiten</button>{/if}</div>
     </section>
 
     <aside class="card log-card"><div class="section-heading"><div><p class="step">DIAGNOSE</p><h2>Scannerereignisse</h2></div><span>{events.length}</span></div>
