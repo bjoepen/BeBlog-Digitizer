@@ -127,7 +127,9 @@ enum ControlMessage {
 
 impl GuidedProcessController {
     #[allow(clippy::too_many_arguments)] // Explicit dependencies keep the fixed process contract auditable.
-    pub(crate) fn start(
+    /// Starts exactly one D5 frame. The caller must already own the AppCore
+    /// scanner lease; D6 will reuse this same entry point under its batch lease.
+    pub(crate) fn start_single_frame(
         &self,
         app: AppHandle,
         resource_dir: PathBuf,
@@ -135,7 +137,7 @@ impl GuidedProcessController {
         archive: ArchiveManager,
         request: GuidedScanRequest,
         cancelled: Arc<AtomicBool>,
-        on_finished: impl FnOnce(bool) + Send + 'static,
+        on_finished: impl FnOnce(bool, bool) + Send + 'static,
     ) -> Result<String, String> {
         validate_request(&request)?;
         ensure_approved_client_supports_frame(request.frame)?;
@@ -166,7 +168,7 @@ impl GuidedProcessController {
         archive: ArchiveManager,
         request: GuidedScanRequest,
         cancelled: Arc<AtomicBool>,
-        on_finished: impl FnOnce(bool) + Send + 'static,
+        on_finished: impl FnOnce(bool, bool) + Send + 'static,
     ) -> Result<String, String> {
         validate_request(&request)?;
         if request.device != "simulator:hardware-free" {
@@ -211,7 +213,7 @@ impl GuidedProcessController {
         archive: ArchiveManager,
         cancelled: Arc<AtomicBool>,
         real_scan: bool,
-        on_finished: impl FnOnce(bool) + Send + 'static,
+        on_finished: impl FnOnce(bool, bool) + Send + 'static,
     ) -> Result<String, String> {
         let run_id = uuid::Uuid::new_v4().to_string();
         let opened = Arc::new(AtomicBool::new(false));
@@ -236,6 +238,8 @@ impl GuidedProcessController {
         let active = self.active.clone();
         let cooldown_until = self.cooldown_until.clone();
         let worker_run_id = run_id.clone();
+        let cleanup_confirmed = Arc::new(AtomicBool::new(true));
+        let worker_cleanup_confirmed = cleanup_confirmed.clone();
         thread::spawn(move || {
             let result = run_client(
                 app.clone(),
@@ -247,6 +251,7 @@ impl GuidedProcessController {
                 opened,
                 cancelled,
                 control_rx,
+                worker_cleanup_confirmed.clone(),
             );
             if real_scan {
                 let until = Instant::now() + REAL_SCAN_COOLDOWN;
@@ -261,19 +266,32 @@ impl GuidedProcessController {
                 );
             }
             let succeeded = result.is_ok();
+            let safe_to_release = worker_cleanup_confirmed.load(Ordering::SeqCst);
             if let Err(error) = result {
                 emit(&app, GuidedUiEvent::ProcessFailed { detail: error });
             }
-            on_finished(succeeded);
-            if let Ok(mut active) = active.lock() {
-                if active
-                    .as_ref()
-                    .is_some_and(|session| session.run_id == worker_run_id)
-                {
-                    *active = None;
+            if safe_to_release {
+                if let Ok(mut active) = active.lock() {
+                    if active
+                        .as_ref()
+                        .is_some_and(|session| session.run_id == worker_run_id)
+                    {
+                        *active = None;
+                    }
                 }
             }
-            emit(&app, GuidedUiEvent::SessionReleased);
+            on_finished(succeeded, safe_to_release);
+            if safe_to_release {
+                emit(&app, GuidedUiEvent::SessionReleased);
+            } else {
+                emit(
+                    &app,
+                    GuidedUiEvent::Diagnostic {
+                        stream: "process",
+                        message: "Scanner-Lease bleibt gesperrt: Prozess-Cleanup nicht vollständig nachgewiesen".into(),
+                    },
+                );
+            }
         });
         Ok(run_id)
     }
@@ -429,6 +447,7 @@ fn run_client(
     opened: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
     controls: Receiver<ControlMessage>,
+    cleanup_confirmed: Arc<AtomicBool>,
 ) -> Result<(), String> {
     if cancelled.load(Ordering::SeqCst) {
         emit(&app, GuidedUiEvent::ProcessCancelled);
@@ -444,6 +463,7 @@ fn run_client(
     let mut child = command
         .spawn()
         .map_err(|error| format!("Minolta-Client konnte nicht gestartet werden: {error}"))?;
+    cleanup_confirmed.store(false, Ordering::SeqCst);
     let pid = child.id();
     let mut stdin = child.stdin.take().ok_or("stdin-Handshakekanal fehlt")?;
     let stdout = child.stdout.take().ok_or("stdout-Ereigniskanal fehlt")?;
@@ -635,6 +655,7 @@ fn run_client(
     if !stdout_closed || !stderr_closed {
         return Err("stdout/stderr wurden nicht vollständig geschlossen".into());
     }
+    cleanup_confirmed.store(true, Ordering::SeqCst);
     emit(&app, GuidedUiEvent::ProcessCleaned);
     if let Some(error) = terminal_error {
         return Err(error);

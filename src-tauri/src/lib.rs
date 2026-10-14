@@ -12,6 +12,7 @@ mod model;
 pub mod offline_import;
 mod process;
 mod scanner_discovery;
+mod scanner_lease;
 mod sidecar;
 mod state_machine;
 

@@ -41,6 +41,122 @@ pub struct OfflineArtifactPaths {
     pub client_log: PathBuf,
 }
 
+/// Opaque capability produced only after the strict four-artifact validator has
+/// read and accepted a capture. D6 journal code consumes this receipt rather
+/// than accepting a caller-provided "validated" boolean or status string.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // Consumed by D6-B3 to gate journal validation on actual files.
+pub(crate) struct ValidatedD6Artifacts {
+    frame: u8,
+    capture_id: String,
+    profile: ValidatedRgb8Profile,
+    files: Vec<FileMetadata>,
+}
+
+#[allow(dead_code)] // Accessed by the D6-B3 journal/finalization sequence.
+impl ValidatedD6Artifacts {
+    pub(crate) fn frame(&self) -> u8 {
+        self.frame
+    }
+
+    pub(crate) fn capture_id(&self) -> &str {
+        &self.capture_id
+    }
+
+    pub(crate) fn profile(&self) -> ValidatedRgb8Profile {
+        self.profile
+    }
+
+    pub(crate) fn files(&self) -> &[FileMetadata] {
+        &self.files
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_validated_d6_artifacts(frame: u8, capture_id: &str) -> ValidatedD6Artifacts {
+    ValidatedD6Artifacts {
+        frame,
+        capture_id: capture_id.into(),
+        profile: ValidatedRgb8Profile {
+            resolution_dpi: 600,
+            pixels_per_line: LEGACY_600_WIDTH,
+            lines: LEGACY_600_HEIGHT,
+            bytes_per_line: LEGACY_600_BYTES_PER_LINE,
+            raw_bytes: LEGACY_600_RAW_BYTES,
+        },
+        files: [
+            "capture.raw",
+            "capture.tiff",
+            "capture.params.txt",
+            "capture.client.log",
+        ]
+        .into_iter()
+        .map(|name| FileMetadata {
+            name: name.into(),
+            media_type: "test/fixture".into(),
+            bytes: 1,
+            sha256: "0".repeat(64),
+        })
+        .collect(),
+    }
+}
+
+/// Validate fixed-path artifacts for the future D6 importer and return a
+/// digest-bound receipt. This does not archive/finalize files; callers must
+/// retain the exclusive work directory and the later importer revalidates them.
+#[allow(dead_code)] // Called by D6-B3 after a single-frame process completes.
+pub(crate) fn validate_d6_artifacts(
+    frame: u8,
+    capture_id: &str,
+    paths: &OfflineArtifactPaths,
+) -> io::Result<ValidatedD6Artifacts> {
+    if !(1..=6).contains(&frame)
+        || capture_id.is_empty()
+        || capture_id.len() > 96
+        || !capture_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return Err(invalid_data("Ungültige D6-Frame- oder Capture-ID"));
+    }
+    let artifacts = [
+        ("capture.raw", &paths.raw, MAX_RAW_BYTES),
+        ("capture.tiff", &paths.tiff, MAX_TIFF_BYTES),
+        ("capture.params.txt", &paths.params_txt, MAX_PARAMS_BYTES),
+        ("capture.client.log", &paths.client_log, MAX_LOG_BYTES),
+    ];
+    let mut contents = Vec::with_capacity(artifacts.len());
+    let mut files = Vec::with_capacity(artifacts.len());
+    for (name, path, max_bytes) in artifacts {
+        let bytes = read_external_artifact(path, max_bytes)?;
+        files.push(FileMetadata {
+            name: name.into(),
+            media_type: match name {
+                "capture.raw" => "application/x-beblog-raw",
+                "capture.tiff" => "image/tiff",
+                _ => "text/plain",
+            }
+            .into(),
+            bytes: bytes.len() as u64,
+            sha256: format!("{:x}", Sha256::digest(&bytes)),
+        });
+        contents.push(bytes);
+    }
+    let profile = validate_artifact_profile(
+        frame,
+        &contents[0],
+        &contents[1],
+        &contents[2],
+        &contents[3],
+    )?;
+    Ok(ValidatedD6Artifacts {
+        frame,
+        capture_id: capture_id.into(),
+        profile,
+        files,
+    })
+}
+
 /// Validate the complete source set and copy it into a fresh, collision-free
 /// directory under the user's selected destination. The export is deliberately
 /// separate from the internal archive and never overwrites existing files.
@@ -1362,6 +1478,29 @@ mod tests {
             fs::write(path, bytes).unwrap();
         }
         paths
+    }
+
+    #[test]
+    fn d6_validation_receipt_is_created_only_from_a_validated_four_artifact_set() {
+        let root = root();
+        let input = root.join("receipt-input");
+        let raw = vec![19; RAW_BYTES];
+        let paths = write_sources(
+            &input,
+            &raw,
+            &tiff(&raw, 1, false, false),
+            &params(),
+            &log(),
+        );
+        let receipt = validate_d6_artifacts(1, "capture-receipt", &paths).unwrap();
+        assert_eq!(receipt.frame(), 1);
+        assert_eq!(receipt.capture_id(), "capture-receipt");
+        assert_eq!(receipt.files().len(), 4);
+        assert_eq!(receipt.profile().raw_bytes, RAW_BYTES as u64);
+
+        fs::write(&paths.raw, vec![20; RAW_BYTES]).unwrap();
+        assert!(validate_d6_artifacts(1, "capture-receipt", &paths).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

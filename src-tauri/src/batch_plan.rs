@@ -3,6 +3,7 @@
 //! This module only defines and persists a plan. It does not start scanner
 //! processes, advance a plan automatically, or connect to the D1 simulation.
 
+use crate::archive::FileMetadata;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,6 +44,7 @@ impl D6BatchRequest {
 pub struct D6BatchId(String);
 
 impl D6BatchId {
+    #[allow(dead_code)] // Constructed by the D6-B3 batch-start path.
     pub(crate) fn new() -> Self {
         Self(format!("d6-batch-{}", uuid::Uuid::new_v4().simple()))
     }
@@ -97,6 +99,8 @@ pub struct D6FrameJournalEntry {
     pub status: D6FrameStatus,
     /// Capture association is persisted before the capture can be finalized.
     pub capture_id: Option<String>,
+    #[serde(default)]
+    pub validated_artifacts: Option<Vec<FileMetadata>>,
     pub failure: Option<String>,
 }
 
@@ -111,6 +115,7 @@ pub struct D6BatchManifest {
 }
 
 impl D6BatchManifest {
+    #[allow(dead_code)] // Used by the D6-B3 batch-start path.
     pub(crate) fn planned(request: &D6BatchRequest) -> Self {
         let batch_id = D6BatchId::new();
         Self {
@@ -124,6 +129,7 @@ impl D6BatchManifest {
                     frame,
                     status: D6FrameStatus::Planned,
                     capture_id: None,
+                    validated_artifacts: None,
                     failure: None,
                 })
                 .collect(),
@@ -170,6 +176,22 @@ impl D6BatchManifest {
                     if entry.failure.is_none() =>
                 {
                     return Err("Terminaler D6-Frame benötigt eine Fehler-/Abbruchnotiz".into());
+                }
+                _ => {}
+            }
+            match entry.status {
+                D6FrameStatus::Planned | D6FrameStatus::Running
+                    if entry.validated_artifacts.is_some() =>
+                {
+                    return Err("Nicht validierter D6-Frame enthält Validierungsbelege".into());
+                }
+                D6FrameStatus::Validated | D6FrameStatus::Completed
+                    if !entry
+                        .validated_artifacts
+                        .as_ref()
+                        .is_some_and(|files| validated_file_set_is_complete(files)) =>
+                {
+                    return Err("D6-Frame benötigt vier vollständige Validierungsbelege".into());
                 }
                 _ => {}
             }
@@ -225,6 +247,22 @@ impl D6BatchManifest {
         }
         Ok(())
     }
+}
+
+fn validated_file_set_is_complete(files: &[FileMetadata]) -> bool {
+    let expected = [
+        "capture.raw",
+        "capture.tiff",
+        "capture.params.txt",
+        "capture.client.log",
+    ];
+    files.len() == expected.len()
+        && expected
+            .iter()
+            .all(|name| files.iter().filter(|file| file.name == *name).count() == 1)
+        && files
+            .iter()
+            .all(|file| file.bytes > 0 && file.sha256.len() == 64)
 }
 
 #[cfg(test)]

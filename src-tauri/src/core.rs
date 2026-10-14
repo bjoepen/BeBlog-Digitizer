@@ -7,6 +7,7 @@ use crate::{
         SimulationMode, StartBatchRequest, StartScanRequest,
     },
     scanner_discovery::{self, DiscoveryResult},
+    scanner_lease::{ScannerAction, ScannerLeaseGuard, ScannerLeaseManager},
     state_machine::ScanStateMachine,
 };
 use serde::Serialize;
@@ -56,6 +57,7 @@ struct CoreData {
     holder_detected: bool,
     jobs: Vec<JobSummary>,
     batch: Option<PendingBatch>,
+    scanner_lease: Option<ScannerLeaseGuard>,
     recovery_notices: Vec<String>,
 }
 
@@ -68,6 +70,7 @@ impl Default for CoreData {
             holder_detected: false,
             jobs: Vec::new(),
             batch: None,
+            scanner_lease: None,
             recovery_notices: Vec::new(),
         }
     }
@@ -80,6 +83,7 @@ pub struct AppCore {
     archive: ArchiveManager,
     clock: Arc<dyn BatchClock>,
     guided: GuidedProcessController,
+    scanner_lease: ScannerLeaseManager,
     resource_dir: std::path::PathBuf,
 }
 
@@ -131,6 +135,7 @@ impl AppCore {
             archive: ArchiveManager::new(archive_root),
             clock,
             guided: GuidedProcessController::default(),
+            scanner_lease: ScannerLeaseManager::default(),
             resource_dir,
         }
     }
@@ -143,6 +148,7 @@ impl AppCore {
             archive: ArchiveManager::new(archive_root),
             clock: Arc::new(SystemBatchClock),
             guided: GuidedProcessController::default(),
+            scanner_lease: ScannerLeaseManager::default(),
             resource_dir: std::path::PathBuf::new(),
         }
     }
@@ -155,9 +161,10 @@ impl AppCore {
         let cancelled = Arc::new(AtomicBool::new(false));
         let mut data = self.data.lock().map_err(|_| "Interner Zustandsfehler")?;
         ensure_idle(&data)?;
+        let lease = self.scanner_lease.acquire(ScannerAction::D5SingleFrame)?;
         let on_finished =
             guided_completion_callback(self.data.clone(), app.clone(), cancelled.clone());
-        let run_id = self.guided.start(
+        let run_id = self.guided.start_single_frame(
             app,
             self.resource_dir.clone(),
             self.archive.root_path().join(".client-work"),
@@ -170,6 +177,7 @@ impl AppCore {
             id: format!("guided-{run_id}"),
             cancelled,
         });
+        data.scanner_lease = Some(lease);
         data.state = ScanState::OpeningScanner;
         data.progress = 0;
         data.holder_detected = false;
@@ -193,6 +201,7 @@ impl AppCore {
         let cancelled = Arc::new(AtomicBool::new(false));
         let mut data = self.data.lock().map_err(|_| "Interner Zustandsfehler")?;
         ensure_idle(&data)?;
+        let lease = self.scanner_lease.acquire(ScannerAction::D1Simulation)?;
         let on_finished =
             guided_completion_callback(self.data.clone(), app.clone(), cancelled.clone());
         let run_id = self.guided.start_simulation(
@@ -207,6 +216,7 @@ impl AppCore {
             id: format!("guided-{run_id}"),
             cancelled,
         });
+        data.scanner_lease = Some(lease);
         data.state = ScanState::OpeningScanner;
         data.progress = 0;
         data.holder_detected = false;
@@ -284,10 +294,12 @@ impl AppCore {
         let pending = {
             let mut data = self.data.lock().map_err(|_| "Interner Zustandsfehler")?;
             ensure_idle(&data)?;
+            let lease = self.scanner_lease.acquire(ScannerAction::D1Simulation)?;
             let pending = self
                 .archive
                 .begin(&request, self.adapter.capture_kind())
                 .map_err(|error| format!("Capture-Archiv konnte nicht angelegt werden: {error}"))?;
+            data.scanner_lease = Some(lease);
             data.active = Some(ActiveJob {
                 id: id.clone(),
                 cancelled: cancelled.clone(),
@@ -316,6 +328,7 @@ impl AppCore {
     pub fn discover_minolta_scanners(&self) -> Result<DiscoveryResult, String> {
         let data = self.data.lock().map_err(|_| "Interner Zustandsfehler")?;
         ensure_idle(&data)?;
+        let _lease = self.scanner_lease.acquire(ScannerAction::Discovery)?;
         let cooldown = self.guided.cooldown_remaining_seconds();
         if cooldown > 0 {
             return Err(format!(
@@ -362,7 +375,9 @@ impl AppCore {
         validate_batch_request(&request)?;
         let mut data = self.data.lock().map_err(|_| "Interner Zustandsfehler")?;
         ensure_idle(&data)?;
+        let lease = self.scanner_lease.acquire(ScannerAction::D1Simulation)?;
         let id = self.create_unique_batch_journal(&request.frames)?;
+        data.scanner_lease = Some(lease);
         data.batch = Some(PendingBatch {
             id: id.clone(),
             request,
@@ -768,7 +783,10 @@ impl AppCore {
                 )
                 .with_batch(batch_snapshot(b))
             });
-            data.batch = None;
+            if data.batch.as_ref().is_some_and(|batch| batch.id == id) {
+                data.batch = None;
+                data.scanner_lease = None;
+            }
             event
         };
         if let Some(event) = event {
@@ -1075,7 +1093,10 @@ impl AppCore {
         let mut data = self.data.lock().expect("core mutex poisoned");
         data.state = terminal;
         data.progress = progress;
-        data.active = None;
+        if data.active.as_ref().is_some_and(|job| job.id == id) {
+            data.active = None;
+            data.scanner_lease = None;
+        }
         if let Some(job) = data.jobs.iter_mut().find(|job| job.id == id) {
             job.state = terminal;
         }
@@ -1083,7 +1104,7 @@ impl AppCore {
 }
 
 fn ensure_idle(data: &CoreData) -> Result<(), String> {
-    if data.active.is_some() || data.batch.is_some() {
+    if data.active.is_some() || data.batch.is_some() || data.scanner_lease.is_some() {
         Err("Ein Scannerjob ist bereits aktiv".into())
     } else {
         Ok(())
@@ -1144,8 +1165,8 @@ fn guided_completion_callback(
     data_ref: Arc<Mutex<CoreData>>,
     app: AppHandle,
     cancelled: Arc<AtomicBool>,
-) -> impl FnOnce(bool) + Send + 'static {
-    move |succeeded| {
+) -> impl FnOnce(bool, bool) + Send + 'static {
+    move |succeeded, cleanup_confirmed| {
         let state = if succeeded {
             ScanState::Completed
         } else if cancelled.load(Ordering::SeqCst) {
@@ -1154,17 +1175,7 @@ fn guided_completion_callback(
             ScanState::Failed
         };
         if let Ok(mut data) = data_ref.lock() {
-            if data
-                .active
-                .as_ref()
-                .is_some_and(|job| job.id.starts_with("guided-"))
-            {
-                data.active = None;
-                data.state = state;
-                if succeeded {
-                    data.progress = 100;
-                }
-            }
+            finish_guided_slot(&mut data, state, succeeded, cleanup_confirmed);
         }
         emit(
             &app,
@@ -1186,6 +1197,28 @@ fn guided_completion_callback(
                 },
             ),
         );
+    }
+}
+
+fn finish_guided_slot(
+    data: &mut CoreData,
+    state: ScanState,
+    succeeded: bool,
+    cleanup_confirmed: bool,
+) {
+    if data
+        .active
+        .as_ref()
+        .is_some_and(|job| job.id.starts_with("guided-"))
+    {
+        data.state = state;
+        if succeeded {
+            data.progress = 100;
+        }
+        if cleanup_confirmed {
+            data.active = None;
+            data.scanner_lease = None;
+        }
     }
 }
 
@@ -1256,6 +1289,48 @@ mod tests {
             ensure_idle(&data),
             Err("Ein Scannerjob ist bereits aktiv".into())
         );
+    }
+
+    #[test]
+    fn guided_reservation_is_held_through_opened_wait_and_uncertain_cleanup() {
+        let manager = ScannerLeaseManager::default();
+        let mut data = CoreData {
+            active: Some(ActiveJob {
+                id: "guided-opened-wait".into(),
+                cancelled: Arc::new(AtomicBool::new(false)),
+            }),
+            scanner_lease: Some(manager.acquire(ScannerAction::D5SingleFrame).unwrap()),
+            state: ScanState::AwaitingHolderConfirmation,
+            ..CoreData::default()
+        };
+        assert!(ensure_idle(&data).is_err());
+        assert!(manager.acquire(ScannerAction::Discovery).is_err());
+
+        finish_guided_slot(&mut data, ScanState::Failed, false, false);
+        assert!(ensure_idle(&data).is_err());
+        assert!(manager.acquire(ScannerAction::D6Batch).is_err());
+
+        finish_guided_slot(&mut data, ScanState::Failed, false, true);
+        assert!(ensure_idle(&data).is_ok());
+        let lease = manager.acquire(ScannerAction::Discovery).unwrap();
+        drop(lease);
+    }
+
+    #[test]
+    fn guided_reservation_releases_only_after_successful_cleanup() {
+        let manager = ScannerLeaseManager::default();
+        let mut data = CoreData {
+            active: Some(ActiveJob {
+                id: "guided-success".into(),
+                cancelled: Arc::new(AtomicBool::new(false)),
+            }),
+            scanner_lease: Some(manager.acquire(ScannerAction::D5SingleFrame).unwrap()),
+            ..CoreData::default()
+        };
+        finish_guided_slot(&mut data, ScanState::Completed, true, true);
+        assert_eq!(data.state, ScanState::Completed);
+        assert_eq!(data.progress, 100);
+        assert!(ensure_idle(&data).is_ok());
     }
 
     #[test]

@@ -60,7 +60,7 @@ pub enum CaptureKind {
     UnclassifiedLegacy,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileMetadata {
     pub name: String,
@@ -120,6 +120,9 @@ enum BeginBatchError {
     Io(io::Error),
 }
 
+// D6-B2 establishes the journal API and validation gate; D6-B3 will be the
+// first production caller. Keep this surface crate-private until then.
+#[allow(dead_code)]
 impl ArchiveManager {
     pub fn new(root: PathBuf) -> Self {
         Self { root }
@@ -131,7 +134,7 @@ impl ArchiveManager {
 
     /// Persist a D6 plan in its own schema and namespace. D1 journals remain in
     /// `batches/` and retain their existing format and recovery behavior.
-    pub fn begin_d6_batch(&self, request: &D6BatchRequest) -> io::Result<D6BatchManifest> {
+    pub(crate) fn begin_d6_batch(&self, request: &D6BatchRequest) -> io::Result<D6BatchManifest> {
         request.validate().map_err(invalid_data)?;
         let directory = self.root.join("batches").join("d6");
         fs::create_dir_all(&directory)?;
@@ -152,7 +155,7 @@ impl ArchiveManager {
 
     /// Reserve the next frame and durably associate its unique capture ID before
     /// artifact validation/finalization is allowed to mark that capture complete.
-    pub fn begin_d6_frame(
+    pub(crate) fn begin_d6_frame(
         &self,
         batch_id: &str,
         frame: u8,
@@ -201,22 +204,27 @@ impl ArchiveManager {
     /// Persist successful artifact validation and capture association before a
     /// caller finalizes the archive capture. This method does not itself validate
     /// files and is deliberately not connected to the D5 import path in D6-B1.
-    pub fn mark_d6_frame_validated(
+    pub(crate) fn mark_d6_frame_validated(
         &self,
         batch_id: &str,
-        frame: u8,
-        capture_id: &str,
+        receipt: &crate::offline_import::ValidatedD6Artifacts,
     ) -> io::Result<()> {
+        let frame = receipt.frame();
+        let capture_id = receipt.capture_id().to_string();
+        if receipt.files().len() != 4 || receipt.profile().raw_bytes == 0 {
+            return Err(invalid_data("Unvollständiger D6-Artefaktvalidierungsbeleg"));
+        }
         self.update_d6_manifest(batch_id, |manifest| {
             let entry = d6_frame_mut(manifest, frame)?;
             if entry.status != D6FrameStatus::Running
-                || entry.capture_id.as_deref() != Some(capture_id)
+                || entry.capture_id.as_deref() != Some(capture_id.as_str())
             {
                 return Err(invalid_data(
                     "D6-Validierung benötigt den laufenden, zugeordneten Capture",
                 ));
             }
             entry.status = D6FrameStatus::Validated;
+            entry.validated_artifacts = Some(receipt.files().to_vec());
             Ok(())
         })
     }
@@ -224,10 +232,13 @@ impl ArchiveManager {
     /// Journal completion is permitted only after the prior durable Validated
     /// association. The future orchestrator must call this after archive
     /// finalization succeeds; failures leave the capture and journal diagnosable.
-    pub fn complete_d6_frame(&self, batch_id: &str, frame: u8) -> io::Result<()> {
+    pub(crate) fn complete_d6_frame(&self, batch_id: &str, frame: u8) -> io::Result<()> {
         self.update_d6_manifest(batch_id, |manifest| {
             let entry = d6_frame_mut(manifest, frame)?;
-            if entry.status != D6FrameStatus::Validated || entry.capture_id.is_none() {
+            if entry.status != D6FrameStatus::Validated
+                || entry.capture_id.is_none()
+                || entry.validated_artifacts.is_none()
+            {
                 return Err(invalid_data(
                     "D6-Capture kann ohne persistierte Validierung nicht abgeschlossen werden",
                 ));
@@ -244,7 +255,7 @@ impl ArchiveManager {
         })
     }
 
-    pub fn fail_d6_frame(
+    pub(crate) fn fail_d6_frame(
         &self,
         batch_id: &str,
         frame: u8,
@@ -267,7 +278,7 @@ impl ArchiveManager {
         })
     }
 
-    pub fn cancel_d6_batch(
+    pub(crate) fn cancel_d6_batch(
         &self,
         batch_id: &str,
         active_frame: Option<u8>,
@@ -876,10 +887,12 @@ fn write_batch_manifest(path: &Path, manifest: &BatchManifest) -> io::Result<()>
     fs::rename(temp, path)
 }
 
+#[allow(dead_code)] // Used by the D6-B3 orchestration path prepared in D6-B2.
 fn d6_batch_path(directory: &Path, batch_id: &str) -> PathBuf {
     directory.join(format!("{batch_id}.json"))
 }
 
+#[allow(dead_code)] // Used by the D6-B3 orchestration path prepared in D6-B2.
 fn write_new_d6_manifest(path: &Path, manifest: &D6BatchManifest) -> io::Result<()> {
     let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
     serde_json::to_writer_pretty(&mut file, manifest).map_err(io::Error::other)?;
@@ -900,6 +913,7 @@ fn write_d6_manifest(path: &Path, manifest: &D6BatchManifest) -> io::Result<()> 
     fs::rename(temporary, path)
 }
 
+#[allow(dead_code)] // Used by the D6-B3 orchestration path prepared in D6-B2.
 fn d6_frame_mut(
     manifest: &mut D6BatchManifest,
     frame: u8,
@@ -1507,9 +1521,13 @@ mod tests {
             .unwrap();
         assert!(first_frame_id.ends_with("-frame-1"));
         assert!(archive.complete_d6_frame(batch_id, 1).is_err());
-        archive
-            .mark_d6_frame_validated(batch_id, 1, "capture-unique-1")
-            .unwrap();
+        let wrong_capture_receipt =
+            crate::offline_import::test_validated_d6_artifacts(1, "capture-other");
+        assert!(archive
+            .mark_d6_frame_validated(batch_id, &wrong_capture_receipt)
+            .is_err());
+        let receipt = crate::offline_import::test_validated_d6_artifacts(1, "capture-unique-1");
+        archive.mark_d6_frame_validated(batch_id, &receipt).unwrap();
         archive.complete_d6_frame(batch_id, 1).unwrap();
         assert!(archive
             .begin_d6_frame(batch_id, 3, "capture-unique-3")
@@ -1542,8 +1560,10 @@ mod tests {
         archive
             .begin_d6_frame(manifest.batch_id.as_str(), 1, "capture-journal-error")
             .unwrap();
+        let receipt =
+            crate::offline_import::test_validated_d6_artifacts(1, "capture-journal-error");
         archive
-            .mark_d6_frame_validated(manifest.batch_id.as_str(), 1, "capture-journal-error")
+            .mark_d6_frame_validated(manifest.batch_id.as_str(), &receipt)
             .unwrap();
         fs::write(&path, b"damaged journal").unwrap();
         assert!(archive
@@ -1612,8 +1632,9 @@ mod tests {
             archive
                 .begin_d6_frame(manifest.batch_id.as_str(), frame, &capture_id)
                 .unwrap();
+            let receipt = crate::offline_import::test_validated_d6_artifacts(frame, &capture_id);
             archive
-                .mark_d6_frame_validated(manifest.batch_id.as_str(), frame, &capture_id)
+                .mark_d6_frame_validated(manifest.batch_id.as_str(), &receipt)
                 .unwrap();
             archive
                 .complete_d6_frame(manifest.batch_id.as_str(), frame)
