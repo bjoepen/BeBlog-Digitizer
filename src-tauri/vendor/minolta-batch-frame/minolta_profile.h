@@ -12,6 +12,7 @@ typedef struct {
 } MinoltaRgb8Geometry;
 
 bool minolta_parse_supported_dpi(const char *text, unsigned *dpi);
+bool minolta_parse_frame(const char *text, unsigned *frame);
 bool minolta_parse_bounded_uint(const char *text, unsigned minimum, unsigned maximum,
                                 unsigned *value);
 bool minolta_validate_holder_polling(unsigned timeout_seconds, unsigned interval_seconds);

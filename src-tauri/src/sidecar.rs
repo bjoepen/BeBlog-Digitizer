@@ -1,7 +1,7 @@
-//! Resolve and verify the fixed ARM64 test sidecar resource.
+//! Resolve and verify fixed ARM64 sidecar resources.
 //!
-//! This module intentionally provides no process-start API. Only the harmless
-//! test sidecar is packaged in D3-B4; production process execution remains gated.
+//! Minolta client resolution is restricted to the explicitly approved binary
+//! digest. The harmless app-self simulator is separate.
 
 use sha2::{Digest, Sha256};
 use std::{
@@ -24,6 +24,30 @@ pub(crate) fn trusted_arm64_test_sidecar() -> TrustedSha256 {
     TrustedSha256::from_bytes(ARM64_TEST_SIDECAR_SHA256)
 }
 
+/// Resolve only the independently approved D5 Minolta client binary.
+pub(crate) fn resolve_approved_minolta_client(resource_dir: &Path) -> io::Result<ResolvedSidecar> {
+    // Explicit release approval for the exact ARM64 candidate approved in D5-HW2.
+    const APPROVED_MINOLTA_CLIENT_SHA256: &str =
+        "d591832bf08e09aaa2758634fa86f0c7138bb63fcb801350743637f58ce2e404";
+    let value = APPROVED_MINOLTA_CLIENT_SHA256;
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Freigegebener Minolta-Clienthash ist ungültig",
+        ));
+    }
+    let mut digest = [0_u8; 32];
+    for (index, byte) in digest.iter_mut().enumerate() {
+        *byte =
+            u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).map_err(io::Error::other)?;
+    }
+    SidecarResolver::resolve(
+        resource_dir,
+        SidecarResource::MinoltaClient,
+        TrustedSha256::from_bytes(digest),
+    )
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct TrustedSha256([u8; 32]);
 
@@ -36,12 +60,14 @@ impl TrustedSha256 {
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum SidecarResource {
     Arm64Test,
+    MinoltaClient,
 }
 
 impl SidecarResource {
     fn relative_path(self) -> PathBuf {
         match self {
             Self::Arm64Test => PathBuf::from("sidecars/macos-aarch64/beblog-test-sidecar"),
+            Self::MinoltaClient => PathBuf::from("sidecars/macos-aarch64/minolta-batch-frame"),
         }
     }
 }
@@ -54,7 +80,6 @@ pub(crate) struct ResolvedSidecar {
 }
 
 impl ResolvedSidecar {
-    #[cfg(test)]
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
@@ -511,5 +536,37 @@ mod tests {
         let resolved = SidecarResolver::resolve_test_harness().unwrap();
         assert_eq!(resolved.path(), std::env::current_exe().unwrap());
         assert_ne!(resolved.sha256(), [0; 32]);
+    }
+
+    #[test]
+    fn approved_minolta_resource_requires_the_exact_pinned_hash() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root =
+            std::env::temp_dir().join(format!("beblog-minolta-approval-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let binary = root.join("sidecars/macos-aarch64/minolta-batch-frame");
+        fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        fs::write(
+            &binary,
+            include_bytes!("../sidecars/macos-aarch64/minolta-batch-frame"),
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        let resolved = resolve_approved_minolta_client(&root).unwrap();
+        assert_eq!(resolved.path(), fs::canonicalize(&binary).unwrap());
+        assert_eq!(
+            format!("{:x}", Sha256::digest(fs::read(&binary).unwrap())),
+            "d591832bf08e09aaa2758634fa86f0c7138bb63fcb801350743637f58ce2e404"
+        );
+        let actual_digest: [u8; 32] = Sha256::digest(fs::read(&binary).unwrap()).into();
+        assert_eq!(resolved.sha256(), actual_digest);
+
+        let mut changed = fs::read(&binary).unwrap();
+        let last = changed.len() - 1;
+        changed[last] ^= 0x01;
+        fs::write(&binary, changed).unwrap();
+        assert!(resolve_approved_minolta_client(&root).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 }

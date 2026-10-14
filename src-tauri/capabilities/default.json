@@ -4,5 +4,5 @@
   "description": "Only the local main window may call the typed application core.",
   "windows": ["main"],
   "local": true,
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "dialog:allow-open"]
 }

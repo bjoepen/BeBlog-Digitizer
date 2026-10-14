@@ -27,6 +27,10 @@ bool minolta_parse_supported_dpi(const char *text, unsigned *dpi) {
            (*dpi == 600U || *dpi == 2820U);
 }
 
+bool minolta_parse_frame(const char *text, unsigned *frame) {
+    return minolta_parse_bounded_uint(text, 1U, 6U, frame);
+}
+
 bool minolta_validate_holder_polling(unsigned timeout_seconds, unsigned interval_seconds) {
     return timeout_seconds >= 1U && timeout_seconds <= 3600U &&
            interval_seconds >= 1U && interval_seconds <= 60U &&

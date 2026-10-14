@@ -28,7 +28,8 @@
     "active": true,
     "targets": ["app"],
     "resources": {
-      "sidecars/macos-aarch64/beblog-test-sidecar": "sidecars/macos-aarch64/beblog-test-sidecar"
+      "sidecars/macos-aarch64/beblog-test-sidecar": "sidecars/macos-aarch64/beblog-test-sidecar",
+      "sidecars/macos-aarch64/minolta-batch-frame": "sidecars/macos-aarch64/minolta-batch-frame"
     }
   }
 }

@@ -41,6 +41,102 @@ pub struct OfflineArtifactPaths {
     pub client_log: PathBuf,
 }
 
+/// Validate the complete source set and copy it into a fresh, collision-free
+/// directory under the user's selected destination. The export is deliberately
+/// separate from the internal archive and never overwrites existing files.
+pub fn export_validated_artifacts(
+    frame: u8,
+    sources: &OfflineArtifactPaths,
+    destination_root: &Path,
+) -> io::Result<PathBuf> {
+    if !(1..=6).contains(&frame) {
+        return Err(invalid_data("Export akzeptiert ausschließlich Frames 1–6"));
+    }
+    let raw = read_external_artifact(&sources.raw, MAX_RAW_BYTES)?;
+    let tiff = read_external_artifact(&sources.tiff, MAX_TIFF_BYTES)?;
+    let params = read_external_artifact(&sources.params_txt, MAX_PARAMS_BYTES)?;
+    let log = read_external_artifact(&sources.client_log, MAX_LOG_BYTES)?;
+    validate_artifact_profile(frame, &raw, &tiff, &params, &log)?;
+
+    fs::create_dir_all(destination_root)?;
+    let metadata = fs::symlink_metadata(destination_root)?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(invalid_data("Ausgabeziel muss ein echtes Verzeichnis sein"));
+    }
+    let root = fs::canonicalize(destination_root)?;
+    let export_dir = reserve_export_directory(&root)?;
+    for (name, bytes) in [
+        ("capture.raw", raw.as_slice()),
+        ("capture.tiff", tiff.as_slice()),
+        ("capture.params.txt", params.as_slice()),
+        ("capture.client.log", log.as_slice()),
+    ] {
+        let result = (|| {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(export_dir.join(name))?;
+            file.write_all(bytes)?;
+            file.sync_all()
+        })();
+        if let Err(error) = result {
+            let marker = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(export_dir.join("EXPORT-INCOMPLETE"));
+            if let Ok(mut marker) = marker {
+                let _ = writeln!(marker, "{error}");
+                let _ = marker.sync_all();
+            }
+            return Err(with_stage_context(error, &export_dir.display().to_string()));
+        }
+    }
+    Ok(export_dir)
+}
+
+fn read_external_artifact(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() || metadata.len() > max_bytes {
+        return Err(invalid_data(
+            "Quellartefakt ist kein reguläres oder zu großes File",
+        ));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(invalid_data("Quellartefakt ist kein reguläres Fileobjekt"));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(max_bytes + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 != metadata.len() || bytes.len() as u64 > max_bytes {
+        return Err(invalid_data(
+            "Quellartefakt änderte sich während des Lesens",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn reserve_export_directory(root: &Path) -> io::Result<PathBuf> {
+    for _ in 0..16 {
+        let path = root.join(format!("BeBlog-Scan-{}", uuid::Uuid::new_v4().simple()));
+        match fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "Kollisionsfreier Ausgabeordner konnte nicht reserviert werden",
+    ))
+}
+
 impl OfflineArtifactPaths {
     /// Fixed output names for a future runner-owned, exclusive capture directory.
     /// The client log is never consulted to construct any of these paths.
@@ -130,9 +226,9 @@ pub fn import_offline_artifacts(
     frame: u8,
     sources: &OfflineArtifactPaths,
 ) -> io::Result<OfflineImportReport> {
-    if !(1..=4).contains(&frame) {
+    if !(1..=6).contains(&frame) {
         return Err(invalid_data(
-            "D3-B3a-Profil akzeptiert ausschließlich Frames 1–4",
+            "Scanprofil akzeptiert ausschließlich Frames 1–6",
         ));
     }
     let (stage_dir, mut stage) = reserve_stage(archive.root_path())?;
@@ -1320,6 +1416,45 @@ mod tests {
             assert_eq!(format!("{:x}", Sha256::digest(archived)), entry.sha256);
         }
         assert_eq!(fs::read(&sources.raw).unwrap().len(), RAW_BYTES);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn validated_export_uses_fresh_directory_and_never_overwrites_existing_capture() {
+        let root = root();
+        fs::create_dir_all(&root).unwrap();
+        let raw = vec![77; RAW_BYTES];
+        let sources = write_sources(
+            &root.join("input"),
+            &raw,
+            &tiff(&raw, 1, false, false),
+            &params(),
+            &log(),
+        );
+        let destination = root.join("external-destination");
+        fs::create_dir(&destination).unwrap();
+        let export = export_validated_artifacts(1, &sources, &destination).unwrap();
+        assert!(export.starts_with(fs::canonicalize(&destination).unwrap()));
+        assert_eq!(fs::read(export.join("capture.raw")).unwrap(), raw);
+        assert_eq!(
+            fs::read(export.join("capture.tiff")).unwrap(),
+            fs::read(&sources.tiff).unwrap()
+        );
+
+        let second = export_validated_artifacts(1, &sources, &destination).unwrap();
+        assert_ne!(export, second);
+        assert!(export.join("capture.raw").is_file());
+        assert!(second.join("capture.raw").is_file());
+
+        let corrupt = root.join("corrupt");
+        let corrupt_paths = write_sources(
+            &corrupt,
+            &raw,
+            &tiff(&vec![1; RAW_BYTES], 1, false, false),
+            &params(),
+            &log(),
+        );
+        assert!(export_validated_artifacts(1, &corrupt_paths, &destination).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 
