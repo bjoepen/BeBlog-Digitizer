@@ -203,4 +203,16 @@ describe("App", () => {
     expect(screen.queryByText("Originale bewahren")).not.toBeInTheDocument();
     expect(screen.queryByText("Separat entwickeln")).not.toBeInTheDocument();
   });
+
+  it("groups scanner setup, scan profile, destination, and both scan workflows", () => {
+    render(App);
+    expect(screen.getByRole("region", { name: "1 · Scanner auswählen" })).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "2 · Scanparameter" })).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "3 · Ausgabeordner" })).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "4 · Scanworkflow wählen" })).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Einzelbildscan" })).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Geführter Mehrbildscan · D6" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Realen Einzelbildscan starten" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Batch mit 4 Bildern starten" })).toBeDisabled();
+  });
 });
