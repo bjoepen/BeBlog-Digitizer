@@ -151,6 +151,27 @@ describe("Filmstreifen- und Einzelbildoberfläche", () => {
     expect(screen.getByLabelText("Bild 1: Fertig")).toBeInTheDocument();
   });
 
+  it("erhält zwei fertige Bilder bei Abbruch von Frame 3 und startet keinen Folgescan", async () => {
+    const tauri = await import("@tauri-apps/api/core");
+    render(App);
+    const handler = eventState.handlers["d6-batch-event"];
+    expect(handler).toBeDefined();
+
+    await handler({ payload: batchEvent({
+      phase: "cancelled", currentFrame: 3, completedFrames: 2, totalFrames: 4,
+      message: "Batch abgebrochen; bereits archivierte Bilder bleiben erhalten",
+    }) });
+
+    expect(await screen.findByLabelText("Bild 1: Fertig")).toBeInTheDocument();
+    expect(screen.getByLabelText("Bild 2: Fertig")).toBeInTheDocument();
+    expect(screen.getByLabelText("Bild 3: Abgebrochen")).toBeInTheDocument();
+    expect(screen.getByLabelText("Bild 4: Wartet")).toBeInTheDocument();
+    expect(screen.getByText(/Filmstreifen abgebrochen · 2 von 4 Bilder fertig/)).toBeInTheDocument();
+    expect(screen.queryByText(/4 von 4 Bildern digitalisiert/)).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Bild 1: Fertig")).toBeInTheDocument();
+    expect(vi.mocked(tauri.invoke)).not.toHaveBeenCalledWith("start_d6_batch", expect.anything());
+  });
+
   it("hält das Ereignisprotokoll ruhig während des Cooldowns und vermeidet doppelte Batch-Erfolgsmeldungen", async () => {
     render(App);
     const handler = eventState.handlers["d6-batch-event"];
