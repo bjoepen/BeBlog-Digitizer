@@ -7,9 +7,11 @@
 
   type D6BatchEvent = { batchId: string; phase: string; currentFrame: number | null; completedFrames: number; totalFrames: number; cooldownRemainingSeconds: number; awaitingHolderConfirmation: boolean; scannerLeaseRetained: boolean; message: string };
   type ScanParameters = Extract<HardwareClientEvent, { kind: "parameters" }>;
+  type ViewMode = "strip" | "single";
 
   let projection = initialGuidedProjection;
   let frame = 1;
+  let viewMode: ViewMode = "strip";
   let dpi = 2820;
   let outputFolder = "";
   let device = "";
@@ -37,10 +39,20 @@
   $: inspectorStatus = d6Batch && showLastBatchState
     ? (d6Batch.phase === "failed" ? "Fehler" : d6Batch.phase === "cancelled" ? "Abgebrochen" : "Abgeschlossen")
     : (!sessionReleased || d6BatchActive ? "Aktiv" : "Bereit");
+  $: stripItems = Array.from({ length: batchSize }, (_, index) => index + 1).map((position) => {
+    if (!d6Batch) return { position, state: "waiting", label: "Wartet" };
+    if (position <= d6Batch.completedFrames) return { position, state: "completed", label: "Fertig" };
+    if (d6Batch.currentFrame === position && d6Batch.phase === "failed") return { position, state: "failed", label: "Fehlgeschlagen" };
+    if (d6Batch.currentFrame === position && d6Batch.phase === "cancelled") return { position, state: "cancelled", label: "Abgebrochen" };
+    if (d6Batch.currentFrame === position && d6Batch.phase === "scanning") return { position, state: "scanning", label: "Wird gescannt" };
+    if (d6Batch.currentFrame === position && ["starting", "awaitingHolderConfirmation", "waitingForHolderDetection"].includes(d6Batch.phase)) return { position, state: "preparing", label: "Wird vorbereitet" };
+    if (d6Batch.currentFrame === position && d6Batch.phase === "cancelling") return { position, state: "preparing", label: "Abbruch läuft" };
+    return { position, state: "waiting", label: "Wartet" };
+  });
+  $: stripActive = viewMode === "strip" && d6BatchActive;
   const d6PhaseNames: Record<string, string> = {
     starting: "Prozess wird vorbereitet", awaitingHolderConfirmation: "Warte auf Halterbestätigung",
     waitingForHolderDetection: "Warte auf Haltererkennung", scanning: "Scan läuft",
-    finalizing: "Artefakte werden geprüft", closingScanner: "Scannerverbindung wird geschlossen",
     interFrameCooldown: "Bereitschaftspause", completed: "Batch abgeschlossen",
     failed: "Batch fehlgeschlagen", cancelled: "Batch abgebrochen", cancelling: "Abbruch läuft"
   };
@@ -116,12 +128,16 @@
     if (!device) return;
     confirmedDevice = device;
     const selected = scanners.find((scanner) => scanner.id === device);
-    discoveryMessage = `${selected?.displayName ?? "Scanner"} bestätigt. Du kannst einen Einzelbildscan vorbereiten.`;
+    discoveryMessage = `${selected?.displayName ?? "Scanner"} bestätigt.`;
   }
 
   function scannerSelectionChanged() {
     confirmedDevice = "";
     if (device) discoveryMessage = "Scanner ausgewählt. Bitte die Auswahl ausdrücklich bestätigen.";
+  }
+
+  function clearFinishedBatchView() {
+    if (!d6BatchActive) d6Batch = null;
   }
 
   async function detectScanners() {
@@ -170,6 +186,8 @@
   async function startGuidedScan() {
     if (cooldownRemaining > 0 || !sessionReleased) return;
     simulationMode = false;
+    d6Batch = null;
+    exportNotice = "";
     sessionReleased = false;
     projection = { ...initialGuidedProjection, state: "openingScanner" };
     try {
@@ -185,6 +203,7 @@
   async function startGuidedSimulation() {
     simulationMode = true;
     sessionReleased = false;
+    d6Batch = null;
     exportNotice = "";
     projection = { ...initialGuidedProjection, state: "openingScanner" };
     try {
@@ -234,84 +253,97 @@
 
 <main>
   <header>
-    <div><p class="eyebrow">BeBlog · Filmwerkstatt</p><h1>BeBlog Digitizer</h1><p class="subtitle">Geführte Einzelbild- und Batchscans für den Minolta DiMAGE Scan Dual II.</p></div>
-    <div class="adapter-badge"><span></span>Minolta ARM64 · D6-Vierer-Batch bestätigt</div>
+    <div><p class="eyebrow">BeBlog · Filmwerkstatt</p><h1>BeBlog Digitizer</h1><p class="subtitle">Geführte Digitalisierung von Kleinbildnegativen.</p></div>
+      <div class:locked={simulationMode} class="adapter-badge"><span></span>{simulationMode ? "Hardwarefreie Simulation · keine Scannerverbindung" : "Für die Filmdigitalisierung"}</div>
   </header>
 
   <div class="workspace">
     <section class="card capture">
-      <div class="section-heading"><div><p class="step">SCANSTEUERUNG</p><h2>Scan vorbereiten</h2></div><span class="safe-note">RGB8 · keine automatische Wiederholung</span></div>
+      <div class="section-heading"><div><p class="step">FILMDIGITALISIERUNG</p><h2>Aufnahme vorbereiten</h2></div><span class="safe-note">RGB8 · keine automatischen Wiederholungen</span></div>
 
-      <section class="control-section" aria-labelledby="scanner-selection-heading">
-        <div class="control-section-heading"><h3 id="scanner-selection-heading">1 · Scanner auswählen</h3><span>Erkennung nur auf ausdrücklichen Klick</span></div>
+      <section class="control-section setup-section" aria-labelledby="scanner-selection-heading">
+        <div class="control-section-heading"><h3 id="scanner-selection-heading">Scanner</h3><span>Erkennung nur auf ausdrücklichen Klick</span></div>
         <div class="folder-row scanner-row"><button class="secondary" disabled={!sessionReleased || cooldownRemaining > 0 || discoveryState === "searching"} on:click={detectScanners}>{discoveryState === "searching" ? "Suche läuft …" : "Scanner erkennen / erneut suchen"}</button><select aria-label="Erkannten Scanner auswählen" bind:value={device} on:change={scannerSelectionChanged} disabled={!sessionReleased || scanners.length === 0 || cooldownRemaining > 0}><option value="">Scanner auswählen</option>{#each scanners as scanner}<option value={scanner.id}>{scanner.displayName}</option>{/each}</select><button class="secondary" disabled={!device || confirmedDevice === device || !sessionReleased} on:click={confirmScannerSelection}>Scanner bestätigen</button></div>
         <p class="hint">Die Erkennung öffnet keinen Scan und bewegt den Filmhalter nicht.</p>{#if discoveryMessage}<p class="inline-status" role="status">{discoveryMessage}</p>{/if}{#if device}<details><summary>Diagnosedaten</summary><code>{device}</code></details>{/if}{#if confirmedDevice}<p class="safe-note" role="status">Auswahl bestätigt: {scanners.find((scanner) => scanner.id === confirmedDevice)?.displayName ?? confirmedDevice}</p>{/if}
       </section>
 
-      <section class="control-section" aria-labelledby="scan-profile-heading">
-        <div class="control-section-heading"><h3 id="scan-profile-heading">2 · Scanparameter</h3><span>Für Einzelbild und Batch</span></div>
-        <div class="control-grid">
-          <label>Filmposition<select bind:value={frame}>{#each [1,2,3,4,5,6] as value}<option value={value}>Frame {value}</option>{/each}</select></label>
-          <label>Auflösung<select bind:value={dpi}><option value={2820}>2.820 dpi · Standard</option><option value={600}>600 dpi · Referenz</option></select></label>
-          <div class="parameter"><span>Farbmodus</span><strong>RGB8</strong></div>
-        </div>
-      </section>
-
-      <section class="control-section" aria-labelledby="output-folder-heading">
-        <div class="control-section-heading"><h3 id="output-folder-heading">3 · Ausgabeordner</h3><span>Auch externe SSD möglich</span></div>
+      <section class="control-section setup-section" aria-labelledby="output-folder-heading">
+        <div class="control-section-heading"><h3 id="output-folder-heading">Speicherort</h3><span>Auch externe SSD möglich</span></div>
         <div class="folder-row"><input aria-label="Ausgabeordner" type="text" readonly placeholder="Noch kein Ordner ausgewählt" bind:value={outputFolder} /><button class="secondary" on:click={chooseFolder}>Ordner auswählen …</button></div>
       </section>
 
-      <section class="control-section workflow-section" aria-labelledby="workflow-heading">
-        <div class="control-section-heading"><h3 id="workflow-heading">4 · Scanworkflow wählen</h3><span>Einzelscan oder geführte Folge</span></div>
-        <div class="workflow-grid">
-          <section class="workflow-card single-workflow" aria-labelledby="single-workflow-heading">
-            <h4 id="single-workflow-heading">Einzelbildscan</h4>
-            <p class="hint">Frame {frame} wird in einem eigenen Clientprozess aufgenommen.</p>
-            <div class="workflow-card-actions"><button class="primary" disabled={d6BatchActive || !clientApproved || !outputFolder.trim() || !device.trim() || confirmedDevice !== device || projection.state !== "idle" || !sessionReleased || cooldownRemaining > 0} on:click={startGuidedScan}>Realen Einzelbildscan starten</button><button class="secondary" disabled={d6BatchActive || !outputFolder.trim() || projection.state !== "idle" || !sessionReleased} on:click={startGuidedSimulation}>Ablauf hardwarefrei simulieren</button></div>
-          </section>
-          <section class="workflow-card d6-panel" aria-labelledby="batch-workflow-heading">
-            <h4 id="batch-workflow-heading">Geführter Mehrbildscan · D6</h4>
-            <div class="folder-row"><label>Anzahl Bilder<select bind:value={batchSize} disabled={d6BatchActive}>{#each [2,3,4,5,6] as count}<option value={count}>{count} Bilder · Frames 1–{count}</option>{/each}</select></label><button class="primary" disabled={d6BatchActive || !outputFolder.trim() || !device.trim() || confirmedDevice !== device || !sessionReleased || cooldownRemaining > 0} on:click={startD6Batch}>Batch mit {batchSize} Bildern starten</button></div>
-        <p class="hint">Standardmäßig vier Bilder. Jeder Frame erhält einen eigenen D5-Clientprozess; der Halter bleibt eingesetzt, wird pro Prozess erneut erkannt und zwischen erfolgreichen Frames gilt der 30-Sekunden-Cooldown.</p>
-        {#if d6Batch}<div class="batch-progress" role="status"><strong>{d6Batch.currentFrame ? `Frame ${d6Batch.currentFrame} von ${d6Batch.totalFrames}` : `${d6Batch.totalFrames} Frames geplant`}</strong><span>{d6Batch.message}</span><progress max={d6Batch.totalFrames} value={d6Batch.completedFrames}></progress>{#if d6Batch.cooldownRemainingSeconds > 0}<span>Bereitschaftspause: {d6Batch.cooldownRemainingSeconds} Sekunden</span>{/if}{#if d6Batch.scannerLeaseRetained}<span class="error-banner">Prozess-Cleanup ungeklärt; Scanner bleibt gesperrt.</span>{/if}</div>{/if}
-          </section>
-        </div>
-        {#if d6BatchActive}<div class="workflow-actions"><button class="secondary" on:click={cancelD6Batch}>D6-Batch abbrechen</button></div>{/if}
-      </section>
+      <nav class="mode-switch" aria-label="Scanmodus">
+        <button class:active={viewMode === "strip"} aria-pressed={viewMode === "strip"} on:click={() => viewMode = "strip"} disabled={d6BatchActive || (projection.state !== "idle" && !["completed", "failed", "cancelled", "timedOut"].includes(projection.state))}>Filmstreifen</button>
+        <button class:active={viewMode === "single"} aria-pressed={viewMode === "single"} on:click={() => viewMode = "single"} disabled={d6BatchActive || (projection.state !== "idle" && !["completed", "failed", "cancelled", "timedOut"].includes(projection.state))}>Einzelbild</button>
+      </nav>
 
-      {#if cooldownRemaining > 0}<p class="safe-note" role="status">Nächster realer Scan frühestens in {cooldownRemaining} Sekunden. Der Cooldown wird im Rust-Core erzwungen.</p>{/if}
+      {#if viewMode === "strip"}
+        <section class="mode-panel" aria-labelledby="filmstrip-heading">
+          <div class="mode-title"><div><p class="step">FILMSTREIFEN</p><h2 id="filmstrip-heading">Bilder in Folge aufnehmen</h2></div><span class="safe-note">Der Halter bleibt eingesetzt</span></div>
+          <div class="control-grid strip-controls">
+            <label>Anzahl Negative<select aria-label="Anzahl Negative" bind:value={batchSize} on:change={clearFinishedBatchView} disabled={d6BatchActive}>{#each [2,3,4,5,6] as count}<option value={count}>{count} Bilder</option>{/each}</select></label>
+            <label>Auflösung<select aria-label="Auflösung" bind:value={dpi} on:change={clearFinishedBatchView} disabled={d6BatchActive}><option value={2820}>2.820 dpi</option><option value={600}>600 dpi</option></select></label>
+            <div class="parameter"><span>Farbmodus</span><strong>RGB8</strong></div>
+          </div>
+          <ol class="filmstrip" aria-label={`${batchSize} Bildpositionen`}>
+            {#each stripItems as item (item.position)}
+              <li class={`film-frame ${item.state}`} aria-label={`Bild ${item.position}: ${item.label}`}><span class="frame-number">{item.position}</span><span class="frame-window" aria-hidden="true"><i></i></span><span class="frame-label">{item.label}</span></li>
+            {/each}
+          </ol>
+          {#if stripActive && d6Batch}
+            <div class="strip-status" role="status"><strong>{d6Batch.completedFrames} von {d6Batch.totalFrames} Bildern fertig</strong><span>{d6Batch.message}</span></div>
+          {/if}
+          {#if d6Batch?.scannerLeaseRetained}<p class="error-banner">Cleanup unklar; der Scanner bleibt gesperrt.</p>{/if}
+          {#if d6BatchActive}<div class="workflow-actions"><button class="secondary" on:click={cancelD6Batch}>Filmstreifen abbrechen</button></div>{:else}
+            <button class="primary start-action" disabled={!outputFolder.trim() || !device.trim() || confirmedDevice !== device || !sessionReleased || cooldownRemaining > 0 || projection.state !== "idle"} on:click={startD6Batch}>Filmstreifen scannen</button>
+          {/if}
+          {#if !d6BatchActive && !d6Batch}<p class="hint contextual-hint">Den Filmhalter vor dem Start herausnehmen. Die Einlegeaufforderung erscheint nach Verbindungsaufbau.</p>{/if}
+        </section>
+      {:else}
+        <section class="mode-panel" aria-labelledby="single-heading">
+          <div class="mode-title"><div><p class="step">EINZELBILD</p><h2 id="single-heading">Ein Bild aufnehmen</h2></div></div>
+          <div class="control-grid single-controls">
+            <label>Filmposition<select aria-label="Filmposition" bind:value={frame} disabled={projection.state !== "idle" && projection.state !== "completed" && projection.state !== "failed" && projection.state !== "cancelled" && projection.state !== "timedOut"}>{#each [1,2,3,4,5,6] as value}<option value={value}>Position {value}</option>{/each}</select></label>
+            <label>Auflösung<select aria-label="Auflösung" bind:value={dpi}><option value={2820}>2.820 dpi</option><option value={600}>600 dpi</option></select></label>
+            <div class="parameter"><span>Farbmodus</span><strong>RGB8</strong></div>
+          </div>
+          <div class="single-actions">
+            <button class="primary" disabled={d6BatchActive || !clientApproved || !outputFolder.trim() || !device.trim() || confirmedDevice !== device || projection.state !== "idle" || !sessionReleased || cooldownRemaining > 0} on:click={startGuidedScan}>Einzelbild scannen</button>
+            <button class="secondary simulation-action" disabled={d6BatchActive || !outputFolder.trim() || projection.state !== "idle" || !sessionReleased} on:click={startGuidedSimulation}>Hardwarefreien Ablauf simulieren</button>
+          </div>
+          {#if !sessionReleased && projection.state === "openingScanner"}<p class="hint contextual-hint">Scanner wird initialisiert. Nach bestätigter Verbindung erscheint die Aufforderung zum Einsetzen.</p>{/if}
+        </section>
+      {/if}
+
+      {#if cooldownRemaining > 0}<p class="safe-note cooldown-note" role="status">Nächster Scan frühestens in {cooldownRemaining} Sekunden.</p>{/if}
 
       {#if d6BatchActive}
         <div class="holder-guide" aria-live="polite">
-          <p><strong>D6-Batch · Frame {d6Batch?.currentFrame ?? 1} von {d6Batch?.totalFrames ?? batchSize}</strong> Der bestehende D5-Einzelframe-Prozess wird für jeden Frame neu gestartet.</p>
+          <p><strong>Bild {d6Batch?.currentFrame ?? 1} von {d6Batch?.totalFrames ?? batchSize}</strong></p>
           {#if d6Batch?.awaitingHolderConfirmation}
-            <p class="prompt"><strong>Filmhalter jetzt einsetzen.</strong> Das echte <code>OPENED</code>-Ereignis ist eingetroffen. Nach Bestätigung wird die tatsächliche Haltererkennung abgewartet.</p>
+            <p class="prompt"><strong>Filmhalter jetzt einsetzen.</strong> Die Scannerverbindung ist geöffnet. Nach Bestätigung folgt die Haltererkennung.</p>
             <button class="primary" on:click={confirmInserted}>Filmhalter eingesetzt bestätigen</button>
           {:else if d6Batch?.phase === "interFrameCooldown"}
             <p><strong>Bereitschaftspause.</strong> Der nächste Prozess startet nach Ablauf des Rust-gesteuerten Countdowns.</p>
           {:else}
-            <p>Der Filmhalter bleibt eingesetzt. Folgeframes werden erst nach neuem Prozessstart, <code>OPENED</code>, automatischem <code>CONTINUE</code> und tatsächlicher <code>HOLDER_DETECTED</code>-Rückmeldung fortgesetzt.</p>
+            <p>Der Filmhalter bleibt eingesetzt. Die nächste Bildposition startet nach Prozessabschluss und Bereitschaftspause.</p>
           {/if}
         </div>
       {:else}
-      <div class="holder-guide" aria-live="polite">
-        <p><strong>1 · {simulationMode ? "Simulator vorbereiten." : "Scanner vorbereiten."}</strong> {simulationMode ? "Der Testprozess erzeugt ausschließlich synthetische Dateien." : "Filmhalter herausnehmen, Klappe schließen und Scanner einschalten."}</p>
-        <p><strong>2 · Verbindung aufbauen.</strong> Die App wartet auf das {simulationMode ? "simulierte " : "bestätigte "}<code>OPENED</code>-Ereignis.</p>
+      <div class="holder-guide contextual-guide" aria-live="polite">
         {#if projection.state === "awaitingHolderConfirmation"}
-          <p class="prompt"><strong>3 · {simulationMode ? "Simulation: Filmhalter jetzt einsetzen." : "Filmhalter jetzt einsetzen."}</strong> Erst nach dem OPENED-Ereignis wird die Einlegeaufforderung gezeigt.</p>
+          <p class="prompt"><strong>{simulationMode ? "Simulation: Halter jetzt einsetzen." : "Filmhalter jetzt einsetzen."}</strong> {simulationMode ? "Das OPENED-Ereignis stammt vom Testprozess." : "Die Scannerverbindung ist geöffnet."}</p>
           <button class="primary" on:click={confirmInserted}>Filmhalter eingesetzt bestätigen</button>
         {:else if projection.state === "waitingForHolderDetection"}
-          <p><strong>4 · Warte auf Haltererkennung.</strong> Die Bestätigung allein setzt den Halterstatus nicht auf erkannt.</p>
-        {:else}
-          <p><strong>3 · Halteraufforderung folgt nach Verbindung.</strong> Die UI zeigt diesen Schritt erst nach einem echten Clientereignis.</p>
+          <p><strong>Warte auf Haltererkennung.</strong> Die Bestätigung allein bedeutet noch nicht, dass der Halter erkannt wurde.</p>
         {/if}
       </div>
       {/if}
 
       {#if projection.error}<p class="error-banner" role="alert">{projection.error}</p>{/if}
-      {#if exportNotice}<p class="success-banner" role="status">{exportNotice}</p>{/if}
-      <div class="gate" role="status"><strong>Hashgebundener Hardwarepfad · Einzelbild- und D6-Batchbetrieb.</strong><span>Keine automatischen Wiederholungen; Folgeframes ausschließlich nach Prozesscleanup und Cooldown.</span></div>
+      {#if viewMode === "strip" && d6Batch?.phase === "completed" && d6Batch.completedFrames === d6Batch.totalFrames}<p class="success-banner" role="status">{d6Batch.completedFrames} von {d6Batch.totalFrames} Bildern digitalisiert · {outputFolder}</p>{/if}
+      {#if viewMode === "strip" && d6Batch?.phase === "failed"}<p class="error-banner" role="alert">{d6Batch.completedFrames} von {d6Batch.totalFrames} Bildern abgeschlossen. Bereits gesicherte Bilder bleiben erhalten.</p>{/if}
+      {#if viewMode === "strip" && d6Batch?.phase === "cancelled"}<p class="hint" role="status">Filmstreifen abgebrochen · {d6Batch.completedFrames} von {d6Batch.totalFrames} Bilder fertig.</p>{/if}
       <div class="actions">{#if projection.state !== "idle" && !["completed", "failed", "cancelled", "timedOut"].includes(projection.state) && !d6BatchActive}<button class="secondary" on:click={cancelGuidedScan}>Einzelbildscan abbrechen</button>{/if}{#if ["completed", "failed", "cancelled", "timedOut"].includes(projection.state) && sessionReleased && !d6BatchActive}<button class="secondary" on:click={prepareNextScan}>Nächsten Einzelbildscan vorbereiten</button>{/if}</div>
     </section>
 
@@ -340,7 +372,7 @@
       {/if}
       {#if projection.error}<p class="error-banner" role="alert">{projection.error}</p>{/if}
       {#if d6Batch?.scannerLeaseRetained}<p class="error-banner" role="alert">Cleanup ungeklärt; Scanner bleibt gesperrt.</p>{/if}
-      {#if exportNotice}<p class="success-banner" role="status">{exportNotice}</p>{/if}
+      {#if exportNotice && !d6Batch}<p class="success-banner" role="status">{exportNotice}</p>{/if}
 
       <div class="section-heading event-heading"><div><p class="step">DIAGNOSE</p><h3>Scannerereignisse</h3></div><span>{events.length}</span></div>
       <div class="log" aria-label="Ereignisprotokoll" aria-live="polite">{#if events.length === 0}<p class="empty">Noch keine Scannerereignisse. Benutzerbestätigung und Hardwareerkennung werden getrennt behandelt.</p>{:else}{#each [...events].reverse() as event}<article class:event-error={event.error}><strong>{event.label}</strong><p>{event.detail}</p></article>{/each}{/if}</div>
